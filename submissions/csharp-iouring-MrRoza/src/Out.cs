@@ -78,18 +78,27 @@ static unsafe class Out
     public static void Str(byte* s, int n)
     {
         if (_end - _p < n * 6 + 2) Grow(n * 6 + 2);
-        byte* o = _p;
+        _p = Escape(_p, s, n);
+    }
+
+    static readonly System.Buffers.SearchValues<byte> NeedsEscape = System.Buffers.SearchValues.Create(
+        "\0\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\"\\"u8);
+
+    /// <summary>
+    /// Writes <paramref name="s"/> as a JSON string literal at <paramref name="o"/> (room for n*6+2 bytes needed)
+    /// and returns the end. One vectorized scan finds the next byte to escape.
+    /// </summary>
+    public static byte* Escape(byte* o, byte* s, int n)
+    {
         *o++ = (byte)'"';
         var span = new ReadOnlySpan<byte>(s, n);
         while (true)
         {
-            int k = span.IndexOfAnyInRange((byte)0, (byte)0x1F);
+            int k = span.IndexOfAny(NeedsEscape);
             int q = k < 0 ? span.Length : k;
-            int k2 = span.Slice(0, q).IndexOfAny((byte)'"', (byte)'\\');
-            if (k2 >= 0) q = k2;
-            fixed (byte* sp = span) Buffer.MemoryCopy(sp, o, q, q);
+            span.Slice(0, q).CopyTo(new Span<byte>(o, q));
             o += q;
-            if (q == span.Length) break;
+            if (k < 0) break;
             byte c = span[q];
             *o++ = (byte)'\\';
             switch (c)
@@ -109,7 +118,19 @@ static unsafe class Out
             span = span.Slice(q + 1);
         }
         *o++ = (byte)'"';
-        _p = o;
+        return o;
+    }
+
+    /// <summary>Writes a non-negative integer at <paramref name="o"/> (room for 20 bytes) and returns the end.</summary>
+    public static byte* IntTo(byte* o, long v)
+    {
+        if (v < 10) { *o = (byte)('0' + v); return o + 1; }
+        byte* tmp = stackalloc byte[20];
+        int i = 20;
+        do { tmp[--i] = (byte)('0' + v % 10); v /= 10; } while (v != 0);
+        int len = 20 - i;
+        Buffer.MemoryCopy(tmp + i, o, len, len);
+        return o + len;
     }
 
     public static void Error(int status, ReadOnlySpan<byte> msg)

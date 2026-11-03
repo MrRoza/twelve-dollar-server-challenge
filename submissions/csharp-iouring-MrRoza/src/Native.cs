@@ -45,6 +45,7 @@ static unsafe class Sqlite
     [DllImport("sqlite3")] public static extern int sqlite3_prepare_v3(nint db, byte* sql, int n, uint flags, nint* stmt, byte** tail);
     [DllImport("sqlite3")] public static extern int sqlite3_step(nint stmt);
     [DllImport("sqlite3")] public static extern int sqlite3_reset(nint stmt);
+    [DllImport("sqlite3")] public static extern int sqlite3_finalize(nint stmt);
     [DllImport("sqlite3")] public static extern int sqlite3_bind_int64(nint stmt, int i, long v);
     [DllImport("sqlite3")] public static extern int sqlite3_bind_text(nint stmt, int i, byte* s, int n, nint destructor);
     [DllImport("sqlite3")] public static extern long sqlite3_column_int64(nint stmt, int i);
