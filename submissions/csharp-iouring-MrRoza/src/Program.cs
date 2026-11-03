@@ -15,9 +15,13 @@ static unsafe class Program
         Jwt.Init(secret);
         var db = new Db(dbPath);
         Db.StartCheckpointer(dbPath);
-        int fd = Listen(host, port);
-        Log.Info($"listening on {host}:{port}, db {dbPath}");
-        new Server(fd, db).Run();
+        // Several SO_REUSEPORT listeners: each listen queue is capped at net.core.somaxconn (4096 by default),
+        // so eight of them hold eight times the pending connections through a ramp or a slow loop turn.
+        int n = (int)Tune.Get("LISTENERS", 8);
+        int[] fds = new int[n];
+        for (int i = 0; i < n; i++) fds[i] = Listen(host, port);
+        Log.Info($"listening on {host}:{port} ({n} listeners), db {dbPath}");
+        new Server(fds, db).Run();
         return 0;
     }
 
@@ -27,6 +31,7 @@ static unsafe class Program
         if (fd < 0) throw new Exception("socket failed: errno " + Libc.Errno);
         int one = 1;
         Libc.setsockopt(fd, Libc.SOL_SOCKET, Libc.SO_REUSEADDR, &one, 4);
+        if (Libc.setsockopt(fd, Libc.SOL_SOCKET, Libc.SO_REUSEPORT, &one, 4) != 0) throw new Exception("SO_REUSEPORT failed: errno " + Libc.Errno);
         // Accepted sockets inherit TCP_NODELAY from the listener on Linux.
         Libc.setsockopt(fd, Libc.IPPROTO_TCP, Libc.TCP_NODELAY, &one, 4);
         byte* addr = stackalloc byte[16];

@@ -6,5 +6,6 @@ set -euo pipefail
 SUB=csharp-iouring-MrRoza
 mkdir -p /w/submissions
 cp -r /repo/test /repo/seed /repo/schema.sql /w/
-rm -rf /w/submissions/$SUB && cp -r /repo/submissions/$SUB /w/submissions/
+# Not .vs (Visual Studio keeps files in it locked) nor Windows build output.
+rm -rf /w/submissions/$SUB && tar -C /repo/submissions --exclude=.vs --exclude=bin --exclude=obj -c $SUB | tar -x -C /w/submissions
 cd /w && bash test/run.sh submissions/$SUB

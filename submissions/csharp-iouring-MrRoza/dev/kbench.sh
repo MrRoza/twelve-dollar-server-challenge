@@ -13,7 +13,7 @@ if [ -n "${REV:-}" ]; then
   rm -rf /w/rev && mkdir -p /w/rev && git -C /repo archive "$REV" submissions/$SUB | tar -x -C /w/rev
   SRC=/w/rev/submissions/$SUB; DST=/w/submissions/rev
 else SRC=/repo/submissions/$SUB; DST=/w/submissions/$SUB; fi
-mkdir -p $DST; rm -rf $DST/src; cp -r $SRC/. $DST/
+mkdir -p $DST; rm -rf $DST/src; tar -C $SRC --exclude=.vs --exclude=./bin --exclude=./obj --exclude=./target -c . | tar -x -C $DST
 ( cd $DST && if [ "$SUB" = csharp-iouring-MrRoza ]; then DEV=1 PROFILE=${PERF:-0} LOG=${LOG:-0} bash build.sh; else bash build.sh; fi >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
 # load.js with every think time divided by SPEED
 sed -e "s|sleep(between(\([^)]*\)))|sleep(between(\1) / $SPEED)|g" /repo/bench/load.js > /w/load-fast.js
