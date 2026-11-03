@@ -166,6 +166,14 @@ unsafe sealed class Uring
         s->BufIndex = 0; /* buf_group */ s->UserData = userData;
     }
 
+    /// <summary>Single-shot MSG_DONTWAIT recv into the buffer ring: drains a socket after a multishot recv ended.</summary>
+    public void PrepRecvOne(int slot, ulong userData)
+    {
+        Sqe* s = GetSqe();
+        s->Opcode = OP_RECV; s->Fd = slot; s->Flags = SQE_FIXED_FILE | SQE_BUFFER_SELECT; s->OpFlags = 0x40; /* MSG_DONTWAIT */
+        s->BufIndex = 0; s->UserData = userData;
+    }
+
     public bool HasPending => _toSubmit > 0;
 
     /// <summary>Next free SQE, zeroed. Submits first if the ring is full.</summary>

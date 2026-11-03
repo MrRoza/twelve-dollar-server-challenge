@@ -27,6 +27,7 @@ unsafe struct Conn
     public ConnState State;
     public byte Readable;        // the poll fired while we were busy with this connection
     public byte CloseAfter;
+    public byte InQ, WantQ;      // on its ring's drain queue / the current connection asked for a drain read
     public Route Route;
     public int SegOff, SegLen;   // the :id path segment
     public int AuthOff, AuthLen; // AuthOff -1 = no Authorization header
@@ -38,19 +39,23 @@ sealed unsafe class Ring
     public Uring U = null!;
     public int Index, Free, Accepts;
     public bool Ms;              // multishot recv + buffer ring (else poll + recv)
+    public int* Q; public int QHead, QTail; // drain queue (FIFO of connection indexes, each at most once)
 }
 
 unsafe sealed partial class Server
 {
-    const ulong OpAccept = 1, OpPoll = 2, OpRecv = 3, OpSend = 4, OpClose = 5, OpTimeout = 6, OpRecvMs = 7;
-    const int MaxRings = 16, MaxAccepts = 64;
+    const ulong OpAccept = 1, OpPoll = 2, OpRecv = 3, OpSend = 4, OpClose = 5, OpTimeout = 6, OpRecvMs = 7, OpRecvOne = 8;
+    // Accepts in flight per ring. A ramp of a few thousand connections a second outruns 64 on the 1 vCPU box
+    // (listen queues fill, clients wait out SYN retransmits), so 512, spread over the listeners.
+    const int MaxRings = 16, MaxAccepts = 512;
     const int InPoolSize = 4096, OutPoolSize = Out.PoolSize, InMax = 65536;
 
     readonly int _slots;              // direct-descriptor slots per ring
     readonly Ring[] _rings = new Ring[MaxRings];
     int _ringCount, _acceptRing;
     readonly Db _db;
-    readonly int _listen;
+    readonly int[] _listens;
+    readonly int[] _listenAccepts;     // accepts in flight per listener (all rings)
     readonly Conn* _conns;            // [ring * _slots + slot]
     readonly int* _ready, _writes;
     int _readyCount, _writeCount;
@@ -74,9 +79,10 @@ unsafe sealed partial class Server
     static readonly int RecvBufs = (int)Tune.Get("RECV_BUFS", 4096), RecvBufSize = (int)Tune.Get("RECV_BUF_SIZE", 2048);
     static readonly bool NoMs = Tune.Get("NO_MULTISHOT", 0) != 0;
 
-    public Server(int listenFd, Db db)
+    public Server(int[] listenFds, Db db)
     {
-        _listen = listenFd;
+        _listens = listenFds;
+        _listenAccepts = new int[listenFds.Length];
         _db = db;
         // A direct-descriptor table can't be larger than RLIMIT_NOFILE.
         ulong* rl = stackalloc ulong[2];
@@ -104,6 +110,7 @@ unsafe sealed partial class Server
         r.U.RegisterSparseFiles(_slots);
         r.Ms = !NoMs && r.U.SetupBufRing(RecvBufs, RecvBufSize);
         if (!r.Ms) Log.Info($"ring {r.Index}: no provided-buffer ring, using poll + recv");
+        r.Q = (int*)NativeMemory.Alloc((nuint)_slots, sizeof(int));
         _rings[_ringCount++] = r;
         Log.Info($"ring {r.Index} up ({_ringCount * _slots} connection slots)");
     }
@@ -112,8 +119,9 @@ unsafe sealed partial class Server
     static ulong Ud(ulong op, int idx, uint gen) => (ulong)gen << 32 | (ulong)(uint)idx << 8 | op;
 
     /// <summary>
-    /// Keeps up to 64 one-shot direct accepts armed on the accepting ring, never more than it has free slots
-    /// (so a burst can't overrun the table). Moves on to another ring, or opens one, only when it is full.
+    /// Keeps up to MaxAccepts one-shot direct accepts armed on the accepting ring (an equal share per listener),
+    /// never more than it has free slots: an accept that finds no free slot has already taken the connection
+    /// off the listen queue. Moves on to another ring, or opens one, only when it is full.
     /// </summary>
     void TopUpAccepts()
     {
@@ -131,11 +139,14 @@ unsafe sealed partial class Server
             _acceptRing = next;
             r = _rings[next];
         }
-        while (r.Accepts < MaxAccepts && r.Free - r.Accepts > 0)
-        {
-            r.U.PrepAcceptDirect(_listen, Ud(OpAccept, r.Index, 0));
-            r.Accepts++;
-        }
+        int share = MaxAccepts / _listens.Length;
+        for (int l = 0; l < _listens.Length; l++)
+            while (_listenAccepts[l] < share && r.Accepts < MaxAccepts && r.Free - r.Accepts > 0)
+            {
+                r.U.PrepAcceptDirect(_listens[l], Ud(OpAccept, l, 0));
+                r.Accepts++;
+                _listenAccepts[l]++;
+            }
     }
 
     public void Run()
@@ -146,7 +157,9 @@ unsafe sealed partial class Server
         while (true)
         {
             TopUpAccepts();
-            if (_ringCount == 1)
+            bool draining = IssueDrainReads();
+            if (draining) { for (int i = 0; i < _ringCount; i++) _rings[i].U.Enter(0, 0); } // queued reads: don't wait
+            else if (_ringCount == 1)
             {
                 // Batch window: wait until BatchMin completions are ready or BatchWaitNs passed, so one turn
                 // (one enter, one SQLite snapshot, one commit) serves many requests.
@@ -155,18 +168,16 @@ unsafe sealed partial class Server
             }
             else
             {
-                // Several rings. A DEFER_TASKRUN ring only posts completions inside its own io_uring_enter, and its
-                // eventfd is no reliable wakeup (hundreds of missed signals per second measured on Linux 6.18), so
-                // this loop polls: enter every ring (submit + run its task work); if fewer than BatchMin completions
-                // are ready and the batch window isn't over, sleep a short step and look again.
-                long deadline = Stopwatch.GetTimestamp() + BatchWaitNs * Stopwatch.Frequency / 1_000_000_000;
-                while (true)
-                {
-                    uint ready = 0;
-                    for (int i = 0; i < _ringCount; i++) { Uring u = _rings[i].U; u.Enter(0, 0); ready += u.ReadyCount; }
-                    if (ready >= BatchMin || (ready > 0 && Stopwatch.GetTimestamp() >= deadline)) break;
-                    Libc.usleep(ready == 0 ? 500u : 200u);
-                }
+                // Several rings, one thread. A DEFER_TASKRUN ring only posts completions inside its own
+                // io_uring_enter (and its eventfd proved no reliable wakeup), so: give every other ring one
+                // non-blocking enter (submit its sends, collect its completions), then wait on ring 0 for the rest
+                // of the batch or the window. Completions on the other rings wait at most one window.
+                uint others = 0;
+                for (int i = 1; i < _ringCount; i++) { Uring u = _rings[i].U; u.Enter(0, 0); others += u.ReadyCount; }
+                // min_complete counts every completion in ring 0's queue, so only the other rings' are subtracted.
+                Uring u0 = _rings[0].U;
+                if (others >= BatchMin || BatchMin <= 1) u0.Enter(0, 0);
+                else u0.Enter(BatchMin - others, BatchWaitNs);
             }
 #if TRACE_LOG
             enters++;
@@ -194,10 +205,11 @@ unsafe sealed partial class Server
                     uint gen = (uint)(ud >> 32);
                     switch (ud & 0xFF)
                     {
-                        case OpAccept: OnAccept(ring, res); break;
+                        case OpAccept: _listenAccepts[idx]--; OnAccept(ring, res); break;
                         case OpPoll: OnPoll(idx, gen, res, flags); break;
                         case OpRecv: OnRecv(idx, res); break;
-                        case OpRecvMs: OnRecvMs(ring, idx, gen, res, flags); break;
+                        case OpRecvMs: OnRecvMs(ring, idx, gen, res, flags, false); break;
+                        case OpRecvOne: OnRecvMs(ring, idx, gen, res, flags, true); break;
                         case OpSend: OnSend(idx, res); break;
                         case OpClose: OnClosed(idx); break;
                         case OpTimeout: _timeoutArmed = false; break;
@@ -222,12 +234,52 @@ unsafe sealed partial class Server
         Conn* c = &_conns[idx];
         r.Free--;
         c->Gen++;
-        c->State = ConnState.Idle; c->Readable = 0; c->InLen = 0; c->ReqLen = 0; c->CloseAfter = 0;
+        c->State = ConnState.Idle; c->Readable = 0; c->InLen = 0; c->ReqLen = 0; c->CloseAfter = 0; c->WantQ = 0;
         if (r.Ms) r.U.PrepRecvMulti(res, Ud(OpRecvMs, idx, c->Gen));
         else r.U.PrepPollMulti(res, Ud(OpPoll, idx, c->Gen));
     }
 
-    void OnRecvMs(Ring ring, int idx, uint gen, int res, uint flags)
+    /// <summary>
+    /// After a burst every connection has data waiting, the buffer ring runs dry and the multishot recvs end
+    /// with ENOBUFS. Re-arming them all at once would only repeat that, so an ended recv isn't re-armed: its
+    /// connection goes on the ring's drain queue, and each turn issues single-shot reads for it, never more
+    /// than half the ring's buffers. A read that fills its buffer is queued again; a short one or EAGAIN means
+    /// the socket is drained, and the multishot recv is armed again.
+    /// </summary>
+    void EnqueueDrain(Ring r, int idx, Conn* c)
+    {
+        c->WantQ = 1;
+        if (c->InQ != 0) return; // already queued (perhaps by this slot's previous connection)
+        c->InQ = 1;
+        r.Q[r.QTail] = idx;
+        r.QTail = r.QTail + 1 == _slots ? 0 : r.QTail + 1;
+    }
+
+    /// <summary>Issues this turn's drain reads. True if any ring still has a queue (then the loop doesn't wait).</summary>
+    bool IssueDrainReads()
+    {
+        bool left = false;
+        for (int ri = 0; ri < _ringCount; ri++)
+        {
+            Ring r = _rings[ri];
+            int budget = RecvBufs / 2;
+            while (r.QHead != r.QTail && budget > 0)
+            {
+                int idx = r.Q[r.QHead];
+                r.QHead = r.QHead + 1 == _slots ? 0 : r.QHead + 1;
+                Conn* c = &_conns[idx];
+                c->InQ = 0;
+                if (c->WantQ == 0 || c->State is ConnState.Free or ConnState.Closing) continue;
+                c->WantQ = 0;
+                r.U.PrepRecvOne(idx % _slots, Ud(OpRecvOne, idx, c->Gen));
+                budget--;
+            }
+            if (r.QHead != r.QTail) left = true;
+        }
+        return left;
+    }
+
+    void OnRecvMs(Ring ring, int idx, uint gen, int res, uint flags, bool one)
     {
         Conn* c = &_conns[idx];
         bool live = c->Gen == gen && c->State is not (ConnState.Free or ConnState.Closing);
@@ -239,12 +291,20 @@ unsafe sealed partial class Server
             ring.U.ProvideBuf(bid);
         }
         if (!live) return;
-        if (ok && (res > 0 || res == -105 /*ENOBUFS: ring ran dry, the data waits in the socket*/))
+        if (ok && res > 0)
         {
-            if ((flags & Uring.CQE_F_MORE) == 0) ring.U.PrepRecvMulti(idx % _slots, Ud(OpRecvMs, idx, c->Gen)); // re-arm
-            if (res > 0 && c->State == ConnState.Idle) Parse(idx, c);
+            if (one)
+            {
+                // A full buffer: there may be more. A short read drained the socket: back to multishot.
+                if (res == RecvBufSize) EnqueueDrain(ring, idx, c);
+                else ring.U.PrepRecvMulti(idx % _slots, Ud(OpRecvMs, idx, c->Gen));
+            }
+            else if ((flags & Uring.CQE_F_MORE) == 0) EnqueueDrain(ring, idx, c); // the multishot recv ended
+            if (c->State == ConnState.Idle) Parse(idx, c);
             return;
         }
+        if (ok && res == -105) { EnqueueDrain(ring, idx, c); return; } // ENOBUFS: ring ran dry, the data waits in the socket
+        if (ok && one && res == -11) { ring.U.PrepRecvMulti(idx % _slots, Ud(OpRecvMs, idx, c->Gen)); return; } // EAGAIN: drained
         // EOF, an error or an oversized request. A response in progress still goes out, then the connection closes.
         if (c->State == ConnState.Idle) Close(idx, c); else c->CloseAfter = 1;
     }
