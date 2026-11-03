@@ -8,7 +8,7 @@
 | Driver | None: direct calls into the static SQLite (`DirectPInvoke`). `native/shim.c` `#include`s the **unmodified** amalgamation and adds thin wrappers around its B-tree cursor API |
 | NuGet packages | None at runtime (only the ILCompiler NativeAOT needs, pinned in `packages.lock.json`) |
 | Deployment | **Direct** on `HOST:PORT` (`0.0.0.0:80`), no Nginx |
-| Needs | Linux 6.1+ io_uring (DEFER_TASKRUN, direct descriptors, multishot poll). No buffer rings |
+| Needs | Linux 6.1+ io_uring (DEFER_TASKRUN, direct descriptors, multishot recv, provided-buffer rings; falls back to multishot poll + recv if the buffer ring is refused) |
 
 `test/run.sh` passes 42/42.
 
@@ -36,7 +36,8 @@ Measured on one core with the k6 user model (below), each stage buffer paid for 
 | Request-at-a-time baseline (one turn per completion, ~2 requests per batch) | 38.9 µs |
 | + collect window (128 completions or 2 ms) | 22.3 µs |
 | + write stage (64 writes or 5 ms) | 21.4 µs |
-| + B-tree reads, `unix-excl`, small things | **18.4 µs** |
+| + B-tree reads, `unix-excl`, small things | 18.4 µs |
+| + multishot recv into a provided-buffer ring (no recv SQE per request) | **~18 µs** (60k users: 20.5 → 19.4) |
 
 The windows only add latency while it's quiet. Under load the buffers fill before the timers fire. Locally,
 p95 stays under 10 ms at 20,000 users.
@@ -68,11 +69,15 @@ decodes the record bytes and writes the JSON. There's no bytecode engine and no 
   (over a million connections). Tested locally with 100,000 connections (2 rings): 0 errors, 67 MB RSS.
 - Accepts are **one-shot direct accepts**, up to 64 in flight, never more than the ring has free slots. A burst
   can't overrun a table.
-- An idle connection holds **no buffer**: just a 72-byte record and a **multishot `POLLIN`**. When the poll
-  fires, a `RECV` with `MSG_DONTWAIT` reads into a pooled 4 KB buffer. Responses are written into pooled 16 KB
-  buffers, with the headers right-aligned in front of the body (no copy). Both buffers go back once the
-  response is sent.
-- Closing is `SHUTDOWN` hard-linked to `CLOSE` (the shutdown ends the multishot poll). A generation counter in
+- An idle connection holds **no buffer**: just a 72-byte record and a **multishot `RECV`** on the ring's
+  provided-buffer ring (4096 buffers of 2 KB, shared by all connections). Arriving bytes are copied into a
+  pooled 4 KB buffer and the provided buffer goes straight back, so receiving costs no SQE per request.
+  Responses are written into pooled 16 KB buffers, with the headers right-aligned in front of the body (no
+  copy). Both pooled buffers go back once the response is sent.
+- Ubuntu's 6.8.0-136+ kernels refuse a buffer-ring registration whose reserved words are zero (Launchpad
+  #2162843), so a refused registration is retried with `resv[0]=1`. If that's refused too, the ring falls back
+  to a multishot `POLLIN` per connection and a `RECV` with `MSG_DONTWAIT` when it fires.
+- Closing is `SHUTDOWN` hard-linked to `CLOSE` (the shutdown ends the multishot recv). A generation counter in
   `user_data` drops late completions of a slot's previous connection.
 - With one ring the loop sleeps in `io_uring_enter` (`EXT_ARG` timeout = the collect window). With several,
   it polls the rings' completion queues and sleeps in short steps. A `DEFER_TASKRUN` ring's eventfd proved an
