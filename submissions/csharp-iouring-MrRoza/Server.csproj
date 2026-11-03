@@ -36,6 +36,8 @@
   <ItemGroup>
     <DirectPInvoke Include="sqlite3" />
     <NativeLibrary Include="$(SqliteLib)" />
+    <!-- PGO training build: the instrumented SQLite needs libgcov. -->
+    <LinkerArg Include="-fprofile-generate" Condition="'$(PgoGen)' == 'true'" />
     <DirectPInvoke Include="libc" />
   </ItemGroup>
 </Project>

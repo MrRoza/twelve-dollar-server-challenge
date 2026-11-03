@@ -37,11 +37,12 @@ static unsafe class Libc
 static unsafe class Sqlite
 {
     public const int OK = 0, ROW = 100, DONE = 101;
-    public const int OPEN_READWRITE = 0x2, OPEN_NOMUTEX = 0x8000;
+    public const int OPEN_READWRITE = 0x2, OPEN_CREATE = 0x4, OPEN_NOMUTEX = 0x8000;
     public const int CHECKPOINT_PASSIVE = 0, CHECKPOINT_RESTART = 2;
     public static readonly nint STATIC = 0;
 
     [DllImport("sqlite3")] public static extern int sqlite3_open_v2(byte* file, nint* db, int flags, byte* vfs);
+    [DllImport("sqlite3")] public static extern int sqlite3_close(nint db);
     [DllImport("sqlite3")] public static extern int sqlite3_exec(nint db, byte* sql, nint cb, nint arg, byte** err);
     [DllImport("sqlite3")] public static extern int sqlite3_prepare_v3(nint db, byte* sql, int n, uint flags, nint* stmt, byte** tail);
     [DllImport("sqlite3")] public static extern int sqlite3_step(nint stmt);
