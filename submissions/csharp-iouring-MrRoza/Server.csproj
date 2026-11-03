@@ -5,7 +5,7 @@
     <AssemblyName>server</AssemblyName>
     <RootNamespace>Twelve</RootNamespace>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>disable</ImplicitUsings>
+    <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
 
