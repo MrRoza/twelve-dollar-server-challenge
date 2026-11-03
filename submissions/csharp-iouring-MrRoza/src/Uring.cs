@@ -124,6 +124,32 @@ unsafe sealed class Uring
         return (int)r;
     }
 
+    // io_uring_getevents_arg + __kernel_timespec for IORING_ENTER_EXT_ARG (kernel 5.11+).
+    readonly ulong* _waitArg = (ulong*)System.Runtime.InteropServices.NativeMemory.AllocZeroed(48);
+    const uint ENTER_EXT_ARG = 1 << 3;
+
+    /// <summary>
+    /// Publishes queued SQEs, then waits until <paramref name="wait"/> completions are ready or
+    /// <paramref name="timeoutNs"/> has passed, whichever comes first.
+    /// </summary>
+    public int SubmitAndWaitTimeout(uint wait, long timeoutNs)
+    {
+        Volatile.Write(ref *_sqTail, _sqTailLocal);
+        uint n = _toSubmit;
+        long* ts = (long*)(_waitArg + 3);
+        ts[0] = timeoutNs / 1_000_000_000; ts[1] = timeoutNs % 1_000_000_000;
+        _waitArg[0] = 0; _waitArg[1] = 0; _waitArg[2] = (ulong)ts; // sigmask, sigmask_sz|pad, ts
+        long r = Libc.syscall(Libc.SYS_io_uring_enter, _fd, n, wait, ENTER_GETEVENTS | ENTER_EXT_ARG, (long)_waitArg, 24);
+        if (r < 0)
+        {
+            int e = Libc.Errno;
+            if (e == 62 /*ETIME*/ || e == 4 /*EINTR*/ || e == 16 /*EBUSY*/ || e == 11 /*EAGAIN*/) return 0;
+            throw new Exception("io_uring_enter failed: errno " + e);
+        }
+        _toSubmit -= (uint)r > n ? n : (uint)r;
+        return (int)r;
+    }
+
     /// <summary>Peeks the next completion. Call <see cref="Advance"/> after handling it.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPeek(out Cqe* cqe)

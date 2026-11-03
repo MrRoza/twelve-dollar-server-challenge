@@ -36,6 +36,9 @@ unsafe sealed class Server
     int _readyCount, _writeCount;
     readonly long* _timeout; // __kernel_timespec for the retry timeout
     bool _timeoutArmed;
+    // Dev tunables (not part of the runtime contract; start.sh never sets them).
+    static readonly uint BatchMin = uint.Parse(Environment.GetEnvironmentVariable("TWELVE_BATCH_MIN") ?? "128");
+    static readonly long BatchWaitNs = long.Parse(Environment.GetEnvironmentVariable("TWELVE_BATCH_WAIT_US") ?? "2000") * 1000;
     readonly long _startTicks = Environment.TickCount64;
     long _now; // unix seconds, refreshed per batch
     readonly byte* _scratch, _name;
@@ -57,11 +60,30 @@ unsafe sealed class Server
     public void Run()
     {
         _ring.PrepAcceptMultishot(_listen, OpAccept);
+#if TRACE_LOG
+        long statT = Environment.TickCount64, enters = 0, cqes = 0, batches = 0, reqs = 0, writeBatches = 0;
+#endif
         while (true)
         {
-            _ring.Submit(1);
+            // Batching (the staged pipeline's first stage): wait until BatchMin completions are queued, or BatchWaitNs
+            // has passed since we went to sleep, so each turn - one SQLite snapshot, one enter - serves more requests.
+            if (BatchMin <= 1) _ring.Submit(1);
+            else _ring.SubmitAndWaitTimeout(BatchMin, BatchWaitNs);
+#if TRACE_LOG
+            enters++;
+            long now = Environment.TickCount64;
+            if (now - statT >= 1000)
+            {
+                Log.Trace($"stats: {enters} enters, {cqes} cqes ({(double)cqes / Math.Max(1, enters):F1}/enter), {batches} batches, " +
+                          $"{reqs} reqs ({(double)reqs / Math.Max(1, batches):F1}/batch), {writeBatches} write commits");
+                statT = now; enters = cqes = batches = reqs = writeBatches = 0;
+            }
+#endif
             while (_ring.TryPeek(out Cqe* cqe))
             {
+#if TRACE_LOG
+                cqes++;
+#endif
                 ulong ud = cqe->UserData;
                 int res = cqe->Res;
                 uint flags = cqe->Flags;
@@ -75,7 +97,13 @@ unsafe sealed class Server
                     case OpTimeout: _timeoutArmed = false; break;
                 }
             }
-            if (_readyCount > 0 || _writeCount > 0) RunBatch();
+            if (_readyCount > 0 || _writeCount > 0)
+            {
+#if TRACE_LOG
+                batches++; reqs += _readyCount + _writeCount; if (_writeCount > 0) writeBatches++;
+#endif
+                RunBatch();
+            }
         }
     }
 
