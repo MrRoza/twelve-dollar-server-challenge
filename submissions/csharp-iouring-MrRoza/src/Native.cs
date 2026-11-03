@@ -1,6 +1,7 @@
 // Raw libc and SQLite imports. Both are bound statically at link time (DirectPInvoke in Server.csproj),
 // so a call is a plain C call: no lazy binding, no marshalling (only blittable types are used).
 using System.Runtime.InteropServices;
+// SuppressGCTransition below marks short, non-blocking calls that never call back into managed code.
 
 namespace Twelve;
 
@@ -44,15 +45,15 @@ static unsafe class Sqlite
     [DllImport("sqlite3")] public static extern int sqlite3_exec(nint db, byte* sql, nint cb, nint arg, byte** err);
     [DllImport("sqlite3")] public static extern int sqlite3_prepare_v3(nint db, byte* sql, int n, uint flags, nint* stmt, byte** tail);
     [DllImport("sqlite3")] public static extern int sqlite3_step(nint stmt);
-    [DllImport("sqlite3")] public static extern int sqlite3_reset(nint stmt);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int sqlite3_reset(nint stmt);
     [DllImport("sqlite3")] public static extern int sqlite3_finalize(nint stmt);
-    [DllImport("sqlite3")] public static extern int sqlite3_bind_int64(nint stmt, int i, long v);
-    [DllImport("sqlite3")] public static extern int sqlite3_bind_text(nint stmt, int i, byte* s, int n, nint destructor);
-    [DllImport("sqlite3")] public static extern long sqlite3_column_int64(nint stmt, int i);
-    [DllImport("sqlite3")] public static extern byte* sqlite3_column_text(nint stmt, int i);
-    [DllImport("sqlite3")] public static extern int sqlite3_column_bytes(nint stmt, int i);
-    [DllImport("sqlite3")] public static extern int sqlite3_changes(nint db);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int sqlite3_bind_int64(nint stmt, int i, long v);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int sqlite3_bind_text(nint stmt, int i, byte* s, int n, nint destructor);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern long sqlite3_column_int64(nint stmt, int i);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern byte* sqlite3_column_text(nint stmt, int i);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int sqlite3_column_bytes(nint stmt, int i);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int sqlite3_changes(nint db);
     [DllImport("sqlite3")] public static extern byte* sqlite3_errmsg(nint db);
-    [DllImport("sqlite3")] public static extern int sqlite3_get_autocommit(nint db);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int sqlite3_get_autocommit(nint db);
     [DllImport("sqlite3")] public static extern int sqlite3_wal_checkpoint_v2(nint db, byte* name, int mode, int* log, int* ckpt);
 }
