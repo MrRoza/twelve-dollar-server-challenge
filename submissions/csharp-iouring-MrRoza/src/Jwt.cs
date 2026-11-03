@@ -10,7 +10,7 @@ namespace Twelve;
 
 static unsafe class Sha256
 {
-    static readonly uint[] K =
+    internal static readonly uint[] K =
     {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
         0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -77,8 +77,13 @@ static unsafe class Sha256
 
 static unsafe class Jwt
 {
-    static readonly uint* Inner = (uint*)System.Runtime.InteropServices.NativeMemory.Alloc(32);
-    static readonly uint* Outer = (uint*)System.Runtime.InteropServices.NativeMemory.Alloc(32);
+    internal static readonly uint* Inner = (uint*)System.Runtime.InteropServices.NativeMemory.Alloc(32);
+    internal static readonly uint* Outer = (uint*)System.Runtime.InteropServices.NativeMemory.Alloc(32);
+
+    // The header every HS256 token from a standard library carries: {"alg":"HS256","typ":"JWT"}. A token whose
+    // header is byte-for-byte this needs no decode or parse to know alg is HS256; any other header is decoded
+    // and checked in full.
+    static ReadOnlySpan<byte> StdHeader => "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"u8;
 
     public static void Init(string secret)
     {
@@ -97,7 +102,58 @@ static unsafe class Jwt
         Sha256.Init(Inner); Sha256.Compress(Inner, pad);
         for (int i = 0; i < 64; i++) pad[i] = (byte)(key[i] ^ 0x5c);
         Sha256.Init(Outer); Sha256.Compress(Outer, pad);
+        Sha256x8.On = System.Runtime.Intrinsics.X86.Avx2.IsSupported && SelfTestBatch();
     }
+
+    /// <summary>The 8-lane HMAC must match the scalar one on messages of every length up to MaxMsg.</summary>
+    static bool SelfTestBatch()
+    {
+        var rng = new Random(7);
+        byte* buf = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc(8 * Sha256x8.MaxMsg);
+        byte** msg = stackalloc byte*[8];
+        int* len = stackalloc int[8];
+        byte* macs = stackalloc byte[8 * 32];
+        byte* one = stackalloc byte[32];
+        bool ok = true;
+        for (int round = 0; round < 200 && ok; round++)
+        {
+            int n = 1 + round % 8;
+            for (int l = 0; l < n; l++)
+            {
+                msg[l] = buf + l * Sha256x8.MaxMsg;
+                len[l] = round < 130 ? (round + l * 7) % 130 : rng.Next(Sha256x8.MaxMsg + 1);
+                for (int i = 0; i < len[l]; i++) msg[l][i] = (byte)rng.Next(256);
+            }
+            Sha256x8.Hmac(msg, len, n, Inner, Outer, macs);
+            for (int l = 0; l < n && ok; l++)
+            {
+                HmacSha256(msg[l], len[l], one);
+                ok = new ReadOnlySpan<byte>(one, 32).SequenceEqual(new ReadOnlySpan<byte>(macs + l * 32, 32));
+            }
+        }
+        System.Runtime.InteropServices.NativeMemory.Free(buf);
+        Log.Info(ok ? "8-lane HMAC on (self-test passed)" : "8-lane HMAC off: self-test mismatch");
+        return ok;
+    }
+
+    /// <summary>
+    /// Length of the signing input (header.payload) of a compact token, or -1 if it has no two dots or a
+    /// missing part. Verify and the batch precompute both use this, so they hash the same bytes.
+    /// </summary>
+    public static int SigningLen(byte* tok, int n)
+    {
+        if (n > 4096) return -1;
+        int d1 = new ReadOnlySpan<byte>(tok, n).IndexOf((byte)'.');
+        if (d1 <= 0) return -1;
+        int d2rel = new ReadOnlySpan<byte>(tok + d1 + 1, n - d1 - 1).IndexOf((byte)'.');
+        if (d2rel <= 0) return -1;
+        int d2 = d1 + 1 + d2rel;
+        return n - d2 - 1 <= 0 ? -1 : d2;
+    }
+
+    public static void HmacBatch(byte** msg, int* len, int n, byte* macs) => Sha256x8.Hmac(msg, len, n, Inner, Outer, macs);
+
+    internal static void HmacScalar(byte* msg, int len, byte* mac) => HmacSha256(msg, len, mac);
 
     static void HmacSha256(byte* msg, int len, byte* mac)
     {
@@ -155,33 +211,37 @@ static unsafe class Jwt
     /// Verifies a compact JWT. On Ok, <paramref name="userId"/> is the integer sub and the username bytes
     /// (unescaped) are copied into <paramref name="nameBuf"/>.
     /// </summary>
-    public static Result Verify(byte* tok, int n, long now, out long userId, byte* nameBuf, int nameCap, out int nameLen)
+    /// <param name="batchMac">This token's HMAC, computed by the write stage's 8-lane pass from the same signing
+    /// input (see <see cref="SigningLen"/>), or null to compute it here.</param>
+    public static Result Verify(byte* tok, int n, long now, out long userId, byte* nameBuf, int nameCap, out int nameLen,
+                                byte* batchMac = null)
     {
         userId = 0; nameLen = 0;
-        if (n > 4096) return Result.Invalid;
+        int d2 = SigningLen(tok, n);
+        if (d2 < 0) return Result.Invalid;
         int d1 = new ReadOnlySpan<byte>(tok, n).IndexOf((byte)'.');
-        if (d1 <= 0) return Result.Invalid;
-        int d2rel = new ReadOnlySpan<byte>(tok + d1 + 1, n - d1 - 1).IndexOf((byte)'.');
-        if (d2rel <= 0) return Result.Invalid;
-        int d2 = d1 + 1 + d2rel;
-        if (n - d2 - 1 <= 0) return Result.Invalid;
+        int d2rel = d2 - d1 - 1;
 
         // Signature first: it's the cheap rejection for garbage and tampering.
         byte* sig = stackalloc byte[48];
         if (B64Decode(tok + d2 + 1, n - d2 - 1, sig, 48) != 32) return Result.Invalid;
-        byte* mac = stackalloc byte[32];
-        HmacSha256(tok, d2, mac);
+        byte* own = stackalloc byte[32];
+        byte* mac = batchMac;
+        if (mac == null) { HmacSha256(tok, d2, own); mac = own; }
         if (!new ReadOnlySpan<byte>(mac, 32).SequenceEqual(new ReadOnlySpan<byte>(sig, 32))) return Result.Invalid;
 
-        // Header: must be a JSON object with "alg":"HS256".
+        // Header: must be a JSON object with "alg":"HS256". The standard header is recognised byte for byte.
         byte* buf = stackalloc byte[3072];
         byte* scratch = stackalloc byte[3072];
-        int hl = B64Decode(tok, d1, buf, 3072);
-        if (hl < 0) return Result.Invalid;
-        var hdr = new JsonFields();
-        if (!Json.ParseObject(buf, hl, ref hdr, scratch, 3072)) return Result.Invalid;
-        if (!hdr.TryGetString("alg"u8, out byte* alg, out int algLen) || !new ReadOnlySpan<byte>(alg, algLen).SequenceEqual("HS256"u8))
-            return Result.Invalid;
+        if (!new ReadOnlySpan<byte>(tok, d1).SequenceEqual(StdHeader))
+        {
+            int hl = B64Decode(tok, d1, buf, 3072);
+            if (hl < 0) return Result.Invalid;
+            var hdr = new JsonFields();
+            if (!Json.ParseObject(buf, hl, ref hdr, scratch, 3072)) return Result.Invalid;
+            if (!hdr.TryGetString("alg"u8, out byte* alg, out int algLen) || !new ReadOnlySpan<byte>(alg, algLen).SequenceEqual("HS256"u8))
+                return Result.Invalid;
+        }
 
         int pl = B64Decode(tok + d1 + 1, d2rel, buf, 3072);
         if (pl < 0) return Result.Invalid;

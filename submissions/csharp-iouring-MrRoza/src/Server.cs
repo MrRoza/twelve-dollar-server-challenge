@@ -65,6 +65,8 @@ unsafe sealed partial class Server
     readonly long _startTicks = Environment.TickCount64;
     long _now;                        // unix seconds, refreshed per batch
     readonly byte* _scratch, _name;
+    readonly byte* _macs = (byte*)NativeMemory.Alloc(Sha256x8.Lanes * 32);
+    byte* _batchMac;                  // the current write's precomputed HMAC, or null
     readonly BufPool _inPool = new(InPoolSize), _outPool = new(OutPoolSize);
 
     // Tunables: compile-time defaults (see Tune.cs).
@@ -464,7 +466,18 @@ unsafe sealed partial class Server
         {
             if (_db.BeginImmediate())
             {
-                for (int i = 0; i < _writeCount; i++) Handle(&_conns[_writes[i]]);
+                int* slot = stackalloc int[Sha256x8.Lanes];
+                for (int s = 0; s < _writeCount; s += Sha256x8.Lanes)
+                {
+                    int n = Math.Min(Sha256x8.Lanes, _writeCount - s);
+                    HmacWrites(s, n, slot);
+                    for (int i = 0; i < n; i++)
+                    {
+                        _batchMac = slot[i] >= 0 ? _macs + slot[i] * 32 : null;
+                        Handle(&_conns[_writes[s + i]]);
+                    }
+                    _batchMac = null;
+                }
                 if (!_db.Commit())
                 {
                     _db.Rollback();
@@ -489,6 +502,31 @@ unsafe sealed partial class Server
             for (int i = 0; i < _readyCount; i++) QueueSend(_ready[i]);
             _readyCount = 0;
         }
+    }
+
+    /// <summary>
+    /// Computes the HMACs of up to 8 writes' bearer tokens together (one AVX2 lane each). slot[i] is where write
+    /// s+i's MAC is in _macs, or -1 (no well-formed token, too long, or too few tokens to be worth it: then
+    /// Verify computes it alone). Every token's signature is still computed from its own bytes, now.
+    /// </summary>
+    void HmacWrites(int s, int n, int* slot)
+    {
+        byte** msg = stackalloc byte*[Sha256x8.Lanes];
+        int* len = stackalloc int[Sha256x8.Lanes];
+        int k = 0;
+        for (int i = 0; i < n; i++)
+        {
+            slot[i] = -1;
+            if (!Sha256x8.On) continue;
+            Conn* c = &_conns[_writes[s + i]];
+            if (c->AuthOff < 0 || c->AuthLen <= 7) continue;
+            byte* tok = c->In + c->AuthOff + 7;
+            int d2 = Jwt.SigningLen(tok, c->AuthLen - 7);
+            if (d2 < 0 || d2 > Sha256x8.MaxMsg) continue;
+            msg[k] = tok; len[k] = d2; slot[i] = k++;
+        }
+        if (k >= 3) Jwt.HmacBatch(msg, len, k, _macs);
+        else for (int i = 0; i < n; i++) slot[i] = -1; // 1-2 tokens: the scalar path is cheaper
     }
 
     void QueueSend(int idx)

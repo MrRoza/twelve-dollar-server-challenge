@@ -76,7 +76,7 @@ unsafe sealed partial class Server
             Out.Error(401, "missing bearer token"u8);
             return false;
         }
-        switch (Jwt.Verify(a + 7, c->AuthLen - 7, _now, out userId, _name, 1024, out nameLen))
+        switch (Jwt.Verify(a + 7, c->AuthLen - 7, _now, out userId, _name, 1024, out nameLen, _batchMac))
         {
             case Jwt.Result.Ok: return true;
             case Jwt.Result.BadPayload: Out.Error(401, "invalid token payload"u8); return false;
