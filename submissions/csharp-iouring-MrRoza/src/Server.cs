@@ -4,8 +4,10 @@
 // transaction (group commit) and the reads in one read transaction, and only then queues the sends.
 // So a 201 is always sent after its row is committed.
 //
-// Idle connections hold no buffer: each one has a multishot POLLIN armed. When it fires, a recv with
-// MSG_DONTWAIT reads into a pooled buffer, which goes back as soon as the response is sent.
+// Idle connections hold no buffer: each one has a multishot recv armed on the ring's provided-buffer ring.
+// Arriving bytes are copied into a pooled per-connection buffer and the provided buffer goes straight back;
+// the pooled one goes back as soon as the response is sent. If the kernel refuses the buffer ring, each
+// connection gets a multishot POLLIN instead, and a recv with MSG_DONTWAIT when it fires.
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -35,11 +37,12 @@ sealed unsafe class Ring
 {
     public Uring U = null!;
     public int Index, Free, Accepts;
+    public bool Ms;              // multishot recv + buffer ring (else poll + recv)
 }
 
 unsafe sealed partial class Server
 {
-    const ulong OpAccept = 1, OpPoll = 2, OpRecv = 3, OpSend = 4, OpClose = 5, OpTimeout = 6;
+    const ulong OpAccept = 1, OpPoll = 2, OpRecv = 3, OpSend = 4, OpClose = 5, OpTimeout = 6, OpRecvMs = 7;
     const int MaxRings = 16, MaxAccepts = 64;
     const int InPoolSize = 4096, OutPoolSize = Out.PoolSize, InMax = 65536;
 
@@ -68,6 +71,8 @@ unsafe sealed partial class Server
     static readonly int WriteMin = (int)Tune.Get("WRITE_MIN", 64);
     static readonly long WriteWaitTicks = Tune.Get("WRITE_WAIT_US", 5000) * Stopwatch.Frequency / 1_000_000;
     static readonly int SlotsOverride = (int)Tune.Get("RING_SLOTS", 0);
+    static readonly int RecvBufs = (int)Tune.Get("RECV_BUFS", 4096), RecvBufSize = (int)Tune.Get("RECV_BUF_SIZE", 2048);
+    static readonly bool NoMs = Tune.Get("NO_MULTISHOT", 0) != 0;
 
     public Server(int listenFd, Db db)
     {
@@ -97,6 +102,8 @@ unsafe sealed partial class Server
         var r = new Ring { Index = _ringCount, Free = _slots };
         r.U = new Uring(4096, 65536);
         r.U.RegisterSparseFiles(_slots);
+        r.Ms = !NoMs && r.U.SetupBufRing(RecvBufs, RecvBufSize);
+        if (!r.Ms) Log.Info($"ring {r.Index}: no provided-buffer ring, using poll + recv");
         _rings[_ringCount++] = r;
         Log.Info($"ring {r.Index} up ({_ringCount * _slots} connection slots)");
     }
@@ -190,6 +197,7 @@ unsafe sealed partial class Server
                         case OpAccept: OnAccept(ring, res); break;
                         case OpPoll: OnPoll(idx, gen, res, flags); break;
                         case OpRecv: OnRecv(idx, res); break;
+                        case OpRecvMs: OnRecvMs(ring, idx, gen, res, flags); break;
                         case OpSend: OnSend(idx, res); break;
                         case OpClose: OnClosed(idx); break;
                         case OpTimeout: _timeoutArmed = false; break;
@@ -215,7 +223,49 @@ unsafe sealed partial class Server
         r.Free--;
         c->Gen++;
         c->State = ConnState.Idle; c->Readable = 0; c->InLen = 0; c->ReqLen = 0; c->CloseAfter = 0;
-        r.U.PrepPollMulti(res, Ud(OpPoll, idx, c->Gen));
+        if (r.Ms) r.U.PrepRecvMulti(res, Ud(OpRecvMs, idx, c->Gen));
+        else r.U.PrepPollMulti(res, Ud(OpPoll, idx, c->Gen));
+    }
+
+    void OnRecvMs(Ring ring, int idx, uint gen, int res, uint flags)
+    {
+        Conn* c = &_conns[idx];
+        bool live = c->Gen == gen && c->State is not (ConnState.Free or ConnState.Closing);
+        bool ok = true;
+        if ((flags & Uring.CQE_F_BUFFER) != 0)
+        {
+            int bid = (int)(flags >> 16);
+            if (live && res > 0) ok = Append(c, ring.U.BufAddr(bid), res);
+            ring.U.ProvideBuf(bid);
+        }
+        if (!live) return;
+        if (ok && (res > 0 || res == -105 /*ENOBUFS: ring ran dry, the data waits in the socket*/))
+        {
+            if ((flags & Uring.CQE_F_MORE) == 0) ring.U.PrepRecvMulti(idx % _slots, Ud(OpRecvMs, idx, c->Gen)); // re-arm
+            if (res > 0 && c->State == ConnState.Idle) Parse(idx, c);
+            return;
+        }
+        // EOF, an error or an oversized request. A response in progress still goes out, then the connection closes.
+        if (c->State == ConnState.Idle) Close(idx, c); else c->CloseAfter = 1;
+    }
+
+    /// <summary>Appends received bytes to the connection's input buffer. False if the request would pass InMax.</summary>
+    bool Append(Conn* c, byte* src, int n)
+    {
+        if (c->In == null) { c->In = _inPool.Take(); c->InCap = InPoolSize; }
+        if (c->InCap - c->InLen < n)
+        {
+            int cap = c->InCap;
+            while (cap - c->InLen < n) cap *= 2;
+            if (cap > InMax) return false;
+            byte* nb = (byte*)NativeMemory.Alloc((nuint)cap);
+            Buffer.MemoryCopy(c->In, nb, cap, c->InLen);
+            ReleaseIn(c);
+            c->In = nb; c->InCap = cap;
+        }
+        Buffer.MemoryCopy(src, c->In + c->InLen, n, n);
+        c->InLen += n;
+        return true;
     }
 
     Uring RingOf(int idx) => _rings[idx / _slots].U;
@@ -291,7 +341,11 @@ unsafe sealed partial class Server
             }
             else _ready[_readyCount++] = idx;
         }
-        else if (r == 0) StartRecv(idx, c); // the rest may already be there; if not, EAGAIN and the poll tells us
+        else if (r == 0)
+        {
+            // Incomplete. Multishot: the rest arrives by itself. Poll: it may already be there; if not, EAGAIN.
+            if (_rings[idx / _slots].Ms) c->State = ConnState.Idle; else StartRecv(idx, c);
+        }
         else Close(idx, c);
     }
 

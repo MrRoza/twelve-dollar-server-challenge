@@ -1,6 +1,6 @@
 // A minimal io_uring driven by the raw syscalls. Everything used here exists in Linux 6.1+ (the benchmark box
-// runs Ubuntu 24.04's 6.8): DEFER_TASKRUN, direct descriptors, multishot poll, EXT_ARG waits. No buffer rings
-// (Ubuntu's 6.8.0-136+ kernels refuse some buffer-ring registrations).
+// runs Ubuntu 24.04's 6.8): DEFER_TASKRUN, direct descriptors, multishot poll and recv, provided-buffer rings,
+// EXT_ARG waits.
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -50,7 +50,10 @@ unsafe sealed class Uring
 {
     public const byte OP_POLL_ADD = 6, OP_TIMEOUT = 11, OP_ACCEPT = 13, OP_CLOSE = 19, OP_SEND = 26, OP_RECV = 27, OP_SHUTDOWN = 34;
     public const byte SQE_FIXED_FILE = 1, SQE_IO_LINK = 4, SQE_IO_HARDLINK = 8, SQE_CQE_SKIP_SUCCESS = 64;
-    public const uint CQE_F_MORE = 2;
+    public const uint CQE_F_BUFFER = 1, CQE_F_MORE = 2;
+    const byte SQE_BUFFER_SELECT = 32;
+    const ushort RECV_MULTISHOT = 2;
+    const uint REGISTER_PBUF_RING = 22;
     const uint POLL_ADD_MULTI = 1, FILE_INDEX_ALLOC = 0xFFFFFFFF;
     const uint SETUP_CQSIZE = 1 << 3, SETUP_SUBMIT_ALL = 1 << 7, SETUP_COOP_TASKRUN = 1 << 8, SETUP_TASKRUN_FLAG = 1 << 9,
                SETUP_SINGLE_ISSUER = 1 << 12, SETUP_DEFER_TASKRUN = 1 << 13;
@@ -116,6 +119,51 @@ unsafe sealed class Uring
     {
         long r = Libc.syscall(Libc.SYS_io_uring_register, Fd, REGISTER_EVENTFD, (long)&efd, 1, 0, 0);
         if (r < 0) throw new Exception("IORING_REGISTER_EVENTFD failed: errno " + Libc.Errno);
+    }
+
+    // Provided-buffer ring (group 0): the kernel picks a buffer per multishot recv completion.
+    byte* _bufRing, _bufBase;
+    int _bufSize;
+    ushort _bufMask, _bufTail;
+
+    /// <summary>
+    /// Registers a provided-buffer ring of <paramref name="entries"/> (power of two) buffers of <paramref name="size"/>
+    /// bytes. Ubuntu's 6.8.0-136+ kernels refuse a registration whose reserved words are all zero (an inverted
+    /// check, Launchpad #2162843), so a refused one is retried once with resv[0]=1. False if both are refused.
+    /// </summary>
+    public bool SetupBufRing(int entries, int size)
+    {
+        _bufRing = (byte*)NativeMemory.AlignedAlloc((nuint)entries * 16, 4096);
+        new Span<byte>(_bufRing, entries * 16).Clear();
+        ulong* reg = stackalloc ulong[5]; // io_uring_buf_reg: ring_addr, ring_entries|bgid|flags, resv[3]
+        reg[0] = (ulong)_bufRing; reg[1] = (uint)entries; reg[2] = reg[3] = reg[4] = 0;
+        long r = Libc.syscall(Libc.SYS_io_uring_register, Fd, REGISTER_PBUF_RING, (long)reg, 1, 0, 0);
+        if (r < 0) { reg[2] = 1; r = Libc.syscall(Libc.SYS_io_uring_register, Fd, REGISTER_PBUF_RING, (long)reg, 1, 0, 0); }
+        if (r < 0) { NativeMemory.AlignedFree(_bufRing); _bufRing = null; return false; }
+        _bufSize = size; _bufMask = (ushort)(entries - 1);
+        _bufBase = (byte*)NativeMemory.AlignedAlloc((nuint)entries * (nuint)size, 64);
+        for (int i = 0; i < entries; i++) ProvideBuf(i);
+        return true;
+    }
+
+    public byte* BufAddr(int bid) => _bufBase + (nint)bid * _bufSize;
+
+    /// <summary>Hands buffer <paramref name="bid"/> back to the kernel.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void ProvideBuf(int bid)
+    {
+        byte* e = _bufRing + (_bufTail & _bufMask) * 16; // io_uring_buf: addr, len, bid (entry 0's resv is the tail)
+        *(ulong*)e = (ulong)BufAddr(bid); *(uint*)(e + 8) = (uint)_bufSize; *(ushort*)(e + 12) = (ushort)bid;
+        _bufTail++;
+        Volatile.Write(ref *(ushort*)(_bufRing + 14), _bufTail);
+    }
+
+    /// <summary>Multishot recv on a direct descriptor into the buffer ring: one CQE per arrival, no SQE per request.</summary>
+    public void PrepRecvMulti(int slot, ulong userData)
+    {
+        Sqe* s = GetSqe();
+        s->Opcode = OP_RECV; s->Fd = slot; s->Flags = SQE_FIXED_FILE | SQE_BUFFER_SELECT; s->Ioprio = RECV_MULTISHOT;
+        s->BufIndex = 0; /* buf_group */ s->UserData = userData;
     }
 
     public bool HasPending => _toSubmit > 0;
