@@ -24,6 +24,7 @@ static unsafe class BtNative
     [DllImport("sqlite3"), SuppressGCTransition] public static extern long tw_rowid(nint cur);
     [DllImport("sqlite3"), SuppressGCTransition] public static extern byte* tw_payload(nint cur, uint* local, uint* total);
     [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_payload_copy(nint cur, uint offset, uint amt, byte* buf);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_lookup_many(nint cur, long* keys, int n, byte* buf, int cap, int* off, int* len);
 }
 
 /// <summary>SQLite record format: a header of serial types, then the column values.</summary>
@@ -106,6 +107,9 @@ unsafe sealed class BtReader
     const int PayloadCap = 1 << 16;
     readonly byte* _sc;                             // feed scratch: post fragments and author names
     const int ScratchCap = 1 << 18;
+    readonly byte* _users = (byte*)NativeMemory.Alloc(UsersCap); // the feed's author records, copied by tw_lookup_many
+    const int UsersCap = 1 << 16;
+    static readonly bool MultiUsers = Tune.Get("MULTI_USERS", 1) != 0;
 
     public BtReader(nint db, uint rootPosts, uint rootUsers, uint rootLikesByPost, uint rootPostsByTime)
     {
@@ -276,14 +280,48 @@ unsafe sealed class BtReader
             *o++ = (byte)'"';
             fragOff[i] = (int)(start - _sc); fragLen[i] = (int)(o - start);
         }
-        for (int i = 0; i < n; i++)
+        if (MultiUsers && n > 0)
         {
-            if (!User(userIds[i], out byte* name, out int nl)) return false;
-            if (end - o < nl * 6 + 2) return false;
-            byte* start = o;
-            o = Out.Escape(o, name, nl);
-            nameOff[i] = (int)(start - _sc); nameLen[i] = (int)(o - start);
+            // The authors: one descent of users for all of them (ascending ids), each page visited once.
+            int* uo = stackalloc int[20];
+            int* ul = stackalloc int[20];
+            long* uk = stackalloc long[20];
+            int* ui = stackalloc int[20];
+            for (int i = 0; i < n; i++) ui[i] = i;
+            for (int i = 1; i < n; i++)
+            {
+                int k = ui[i]; long v = userIds[k]; int j = i - 1;
+                while (j >= 0 && userIds[ui[j]] > v) { ui[j + 1] = ui[j]; j--; }
+                ui[j + 1] = k;
+            }
+            for (int j = 0; j < n; j++) uk[j] = userIds[ui[j]];
+            if (BtNative.tw_lookup_many(_cUsers, uk, n, _users, UsersCap, uo, ul) != 0) return false;
+            for (int j = 0; j < n; j++)
+            {
+                int i = ui[j];
+                byte* name; int nl;
+                if (ul[j] == -1) return false; // no such user: the SQL JOIN would drop the post
+                if (ul[j] == -2) { if (!User(uk[j], out name, out nl)) return false; } // overflow record
+                else
+                {
+                    if (!r.Parse(_users + uo[j], ul[j], 2) || !r.IsText(1)) return false;
+                    name = r.Text(1, out nl);
+                }
+                if (end - o < nl * 6 + 2) return false;
+                byte* start = o;
+                o = Out.Escape(o, name, nl);
+                nameOff[i] = (int)(start - _sc); nameLen[i] = (int)(o - start);
+            }
         }
+        else
+            for (int i = 0; i < n; i++)
+            {
+                if (!User(userIds[i], out byte* name, out int nl)) return false;
+                if (end - o < nl * 6 + 2) return false;
+                byte* start = o;
+                o = Out.Escape(o, name, nl);
+                nameOff[i] = (int)(start - _sc); nameLen[i] = (int)(o - start);
+            }
 
         long* likes = stackalloc long[20];
         new Span<long>(likes, 20).Clear();
