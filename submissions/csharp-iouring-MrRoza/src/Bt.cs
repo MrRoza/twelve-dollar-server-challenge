@@ -8,20 +8,22 @@ using System.Text;
 
 namespace Twelve;
 
+// SuppressGCTransition: these are short, never block and never call back into managed code, so the
+// cooperative-GC transition (RhpPInvoke/RhpPInvokeReturn) is pure overhead.
 static unsafe class BtNative
 {
-    [DllImport("sqlite3")] public static extern int tw_cursor_size();
-    [DllImport("sqlite3")] public static extern nint tw_btree(nint db);
-    [DllImport("sqlite3")] public static extern nint tw_keyinfo(nint db, int nKey, int nExtra, uint descMask);
-    [DllImport("sqlite3")] public static extern int tw_open(nint bt, uint root, nint keyInfo, nint cur);
-    [DllImport("sqlite3")] public static extern int tw_close(nint cur);
-    [DllImport("sqlite3")] public static extern int tw_first(nint cur, int* empty);
-    [DllImport("sqlite3")] public static extern int tw_next(nint cur);
-    [DllImport("sqlite3")] public static extern int tw_seek_rowid(nint cur, long rowid, int* res);
-    [DllImport("sqlite3")] public static extern int tw_seek_ge_int(nint cur, nint keyInfo, long v, int* eof);
-    [DllImport("sqlite3")] public static extern long tw_rowid(nint cur);
-    [DllImport("sqlite3")] public static extern byte* tw_payload(nint cur, uint* local, uint* total);
-    [DllImport("sqlite3")] public static extern int tw_payload_copy(nint cur, uint offset, uint amt, byte* buf);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_cursor_size();
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern nint tw_btree(nint db);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern nint tw_keyinfo(nint db, int nKey, int nExtra, uint descMask);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_open(nint bt, uint root, nint keyInfo, nint cur);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_close(nint cur);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_first(nint cur, int* empty);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_next(nint cur);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_seek_rowid(nint cur, long rowid, int* res);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_seek_ge_int(nint cur, nint keyInfo, long v, int* eof);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern long tw_rowid(nint cur);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern byte* tw_payload(nint cur, uint* local, uint* total);
+    [DllImport("sqlite3"), SuppressGCTransition] public static extern int tw_payload_copy(nint cur, uint offset, uint amt, byte* buf);
 }
 
 /// <summary>SQLite record format: a header of serial types, then the column values.</summary>
