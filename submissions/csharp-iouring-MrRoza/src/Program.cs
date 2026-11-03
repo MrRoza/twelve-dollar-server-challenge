@@ -5,8 +5,9 @@ namespace Twelve;
 
 static unsafe class Program
 {
-    static int Main()
+    static int Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--train") return Trainer.Run(args[1]); // build.sh's PGO training run
         string dbPath = Environment.GetEnvironmentVariable("SQLITE_PATH") ?? "feed.db";
         string secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "twelve-dollar-challenge";
         string host = Environment.GetEnvironmentVariable("HOST") ?? "127.0.0.1";
