@@ -8,6 +8,9 @@ static unsafe class Program
     static int Main(string[] args)
     {
         if (args.Length == 2 && args[0] == "--train") return Trainer.Run(args[1]); // build.sh's PGO training run
+#if DEV_TUNABLES
+        if (args.Length == 1 && args[0] == "--bench-jwt") { Jwt.Init("bench-secret"); JwtBench.Run(); return 0; }
+#endif
         string dbPath = Environment.GetEnvironmentVariable("SQLITE_PATH") ?? "feed.db";
         string secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? "twelve-dollar-challenge";
         string host = Environment.GetEnvironmentVariable("HOST") ?? "127.0.0.1";
