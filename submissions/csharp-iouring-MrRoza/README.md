@@ -49,7 +49,9 @@ decodes the record bytes and writes the JSON. There's no bytecode engine and no 
 
 - **Feed:** walk `posts_created_at_id_idx` from its first entry. It is `(created_at DESC, id DESC)`, so that
   *is* `ORDER BY created_at DESC, id DESC`. Look the 20 posts up in ascending id order: neighbours land in the
-  same leaf, and SQLite's `TableMoveto` steps to the next cell. Then look up the 20 authors in `users`. Then
+  same leaf, and SQLite's `TableMoveto` steps to the next cell. Then look up the 20 authors in `users` in one
+  descent (`tw_lookup_many` in `native/shim.c`: sorted keys, each page visited once for all the keys below it,
+  with SQLite's own page search), not 20 root-to-leaf walks. Then
   count the likes with one range walk of `likes_post_id_idx` when the ids are within 512 of each other, or one
   seek per post otherwise.
 - **Live reads (rule 5):** cursors exist only inside a batch's read transaction. Every byte of every response
@@ -124,7 +126,8 @@ learned from other submissions. Thanks to their authors for documenting it so we
     within 512), which our `Bt.cs` follows closely
 - **[c-iouring-pavlyhalim](../c-iouring-pavlyhalim)** (#245) and the other top entries: reading SQLite's
   B-tree cursors through a shim that `#include`s the unmodified amalgamation, inside one read transaction per
-  batch.
+  batch. From pavlyhalim also: looking up a feed's 20 authors in one descent of `users`, and profile-guided
+  SQLite trained on a synthetic database at build time.
 - The C# io_uring entries ([csharp-iouring-oswaldosierra](../csharp-iouring-oswaldosierra),
   [csharp-iouring-AlexandruLT](../csharp-iouring-AlexandruLT),
   [csharp-iouring-jit-gichamba](../csharp-iouring-jit-gichamba)), for seeing how far C# goes on this box.
