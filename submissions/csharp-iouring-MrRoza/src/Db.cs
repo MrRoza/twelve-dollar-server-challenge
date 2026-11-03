@@ -49,8 +49,11 @@ unsafe sealed class Db
     {
         nint db;
         byte[] p = Encoding.UTF8.GetBytes(path + "\0");
+        // unix-excl: the process holds the file exclusively, so the WAL index lives in heap memory shared by
+        // our two connections (no -shm mmap, no fcntl lock syscalls per transaction).
+        fixed (byte* vfs = "unix-excl\0"u8)
         fixed (byte* pp = p)
-            if (Sqlite.sqlite3_open_v2(pp, &db, Sqlite.OPEN_READWRITE | Sqlite.OPEN_NOMUTEX, null) != Sqlite.OK)
+            if (Sqlite.sqlite3_open_v2(pp, &db, Sqlite.OPEN_READWRITE | Sqlite.OPEN_NOMUTEX, vfs) != Sqlite.OK)
                 throw new Exception("cannot open " + path);
         return db;
     }
