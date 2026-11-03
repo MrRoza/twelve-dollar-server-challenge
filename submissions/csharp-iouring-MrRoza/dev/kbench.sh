@@ -29,7 +29,7 @@ if [ "${PERF:-0}" = 1 ]; then
   PERFBIN=$(ls /usr/lib/linux-tools/*/perf | head -1)
   ( sleep 12; $PERFBIN record -F 1999 -g -p $PID -o /w/perf.data -- sleep 15 >/w/perf.log 2>&1 ) &
 fi
-taskset -c 2-21 k6 run -q --no-color -e VUS=$VUS -e RAMP_UP=10s -e DURATION=$HOLD -e TOKENS=/repo/seed/tokens.json \
+taskset -c 2-21 k6 run -q --no-color ${K6_LOCAL_IPS:+--local-ips=$K6_LOCAL_IPS} -e VUS=$VUS -e RAMP_UP=10s -e DURATION=$HOLD -e TOKENS=/repo/seed/tokens.json \
   -e BASE_URL=http://127.0.0.1:3000 --summary-export /w/k6.json /w/load-fast.js > /w/k6.txt 2>&1 || true
 read -r u1 s1 < <(awk '{print $14, $15}' /proc/$PID/stat)
 TICK=$(getconf CLK_TCK)

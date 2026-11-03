@@ -27,7 +27,7 @@ unsafe sealed class Db
         Exec(_db, "PRAGMA synchronous=NORMAL");
         Exec(_db, "PRAGMA wal_autocheckpoint=0"); // the checkpoint thread does it, off the request path
         Exec(_db, "PRAGMA cache_size=-262144");    // 256 MB page cache
-        Exec(_db, "PRAGMA mmap_size=536870912");
+        Exec(_db, "PRAGMA mmap_size=" + (Environment.GetEnvironmentVariable("TWELVE_MMAP") ?? "536870912"));
         Exec(_db, "PRAGMA temp_store=MEMORY");
         Exec(_db, "PRAGMA busy_timeout=0"); // never block the event loop: a busy write retries next turn
         _begin = Prep("BEGIN");
@@ -348,13 +348,14 @@ unsafe sealed class Db
 
     /// <summary>
     /// Checkpoints on their own connection and thread, so their fsyncs never block the event loop.
-    /// PASSIVE every 50 ms keeps the backlog small. Once the WAL holds more than RestartFrames frames, a RESTART
+    /// PASSIVE every 250 ms keeps the backlog small. Once the WAL holds more than RestartFrames frames, a RESTART
     /// checkpoint makes the next writer start the WAL over from frame 1. Without restarts the WAL index hash
     /// chains of hot pages grow with every commit, and every page lookup walks them (walFindFrame was ~20% of CPU).
     /// </summary>
     public static void StartCheckpointer(string path)
     {
-        const int RestartFrames = 2000;
+        int RestartFrames = int.Parse(Environment.GetEnvironmentVariable("TWELVE_CKPT_RESTART") ?? "20000");
+        int PeriodMs = int.Parse(Environment.GetEnvironmentVariable("TWELVE_CKPT_MS") ?? "250");
         var t = new Thread(() =>
         {
             nint db = Open(path);
@@ -364,7 +365,7 @@ unsafe sealed class Db
             Exec(db, "SELECT count(*) FROM sqlite_schema");
             while (true)
             {
-                Thread.Sleep(50);
+                Thread.Sleep(PeriodMs);
                 int log, ckpt;
                 long t0 = Environment.TickCount64;
                 int rc = Sqlite.sqlite3_wal_checkpoint_v2(db, null, Sqlite.CHECKPOINT_PASSIVE, &log, &ckpt);
