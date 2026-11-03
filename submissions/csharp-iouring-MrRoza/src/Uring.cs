@@ -156,6 +156,12 @@ unsafe sealed class Uring
         s->OpFlags = 0x4000; /* MSG_NOSIGNAL */ s->UserData = userData;
     }
 
+    public void PrepTimeout(long* ts, ulong userData)
+    {
+        Sqe* s = GetSqe();
+        s->Opcode = OP_TIMEOUT; s->Fd = -1; s->Addr = (ulong)ts; s->Len = 1; s->UserData = userData;
+    }
+
     public void PrepClose(int fd, ulong userData)
     {
         Sqe* s = GetSqe();
