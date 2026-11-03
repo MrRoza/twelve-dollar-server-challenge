@@ -18,6 +18,9 @@
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <CppCompilerAndLinker>gcc</CppCompilerAndLinker>
+    <SqliteLib Condition="'$(SqliteLib)' == ''">obj/sqlite/libsqlite3.a</SqliteLib>
+    <!-- Keep symbols in the binary so perf can name functions (no runtime cost). -->
+    <StripSymbols>false</StripSymbols>
   </PropertyGroup>
 
   <!-- dotnet publish -p:Log=true compiles the trace logging in (TRACE_LOG). Otherwise Log.* calls are removed. -->
@@ -27,7 +30,7 @@
 
   <ItemGroup>
     <DirectPInvoke Include="sqlite3" />
-    <NativeLibrary Include="obj/sqlite/libsqlite3.a" />
+    <NativeLibrary Include="$(SqliteLib)" />
     <DirectPInvoke Include="libc" />
   </ItemGroup>
 </Project>

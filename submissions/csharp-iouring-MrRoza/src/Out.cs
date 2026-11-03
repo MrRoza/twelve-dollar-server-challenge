@@ -19,6 +19,15 @@ static unsafe class Out
         _end = c->Out + c->OutCap;
     }
 
+    /// <summary>Write position as an offset into the connection's buffer (stable across Grow).</summary>
+    public static int Pos
+    {
+        get => (int)(_p - _c->Out);
+        set => _p = _c->Out + value;
+    }
+
+    public static byte* At(int off) => _c->Out + off;
+
     static void Grow(int need)
     {
         int used = (int)(_p - _c->Out);

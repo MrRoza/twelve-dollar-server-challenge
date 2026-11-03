@@ -29,7 +29,7 @@ static unsafe class Sqlite
 {
     public const int OK = 0, ROW = 100, DONE = 101;
     public const int OPEN_READWRITE = 0x2, OPEN_NOMUTEX = 0x8000;
-    public const int CHECKPOINT_PASSIVE = 0;
+    public const int CHECKPOINT_PASSIVE = 0, CHECKPOINT_RESTART = 2;
     public static readonly nint STATIC = 0;
 
     [DllImport("sqlite3")] public static extern int sqlite3_open_v2(byte* file, nint* db, int flags, byte* vfs);

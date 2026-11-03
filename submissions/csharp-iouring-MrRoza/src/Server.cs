@@ -16,7 +16,7 @@ unsafe struct Conn
     public byte* In; public int InLen, InCap;
     public byte* Out; public int OutCap, OutStart, OutEnd;
     public int ReqLen;          // bytes of In used by the request being served
-    public byte Open, CloseAfter, Wrote;
+    public byte Open, CloseAfter;
     public Route Route;
     public int SegOff, SegLen;  // the :id path segment
     public int AuthOff, AuthLen; // -1 = no Authorization header
@@ -25,15 +25,17 @@ unsafe struct Conn
 
 unsafe sealed class Server
 {
-    const ulong OpAccept = 1, OpRecv = 2, OpSend = 3;
+    const ulong OpAccept = 1, OpRecv = 2, OpSend = 3, OpTimeout = 4;
     const int MaxFd = 65536, InInitial = 4096, InMax = 65536;
 
     readonly Uring _ring;
     readonly Db _db;
     readonly int _listen;
     readonly Conn* _conns;
-    readonly int* _ready;
-    int _readyCount;
+    readonly int* _ready, _writes;
+    int _readyCount, _writeCount;
+    readonly long* _timeout; // __kernel_timespec for the retry timeout
+    bool _timeoutArmed;
     readonly long _startTicks = Environment.TickCount64;
     long _now; // unix seconds, refreshed per batch
     readonly byte* _scratch, _name;
@@ -45,6 +47,9 @@ unsafe sealed class Server
         _ring = new Uring(4096, 65536);
         _conns = (Conn*)NativeMemory.AllocZeroed((nuint)MaxFd, (nuint)sizeof(Conn));
         _ready = (int*)NativeMemory.Alloc((nuint)MaxFd, sizeof(int));
+        _writes = (int*)NativeMemory.Alloc((nuint)MaxFd, sizeof(int));
+        _timeout = (long*)NativeMemory.Alloc(16);
+        _timeout[0] = 0; _timeout[1] = 1_000_000; // 1 ms
         _scratch = (byte*)NativeMemory.Alloc(InMax);
         _name = (byte*)NativeMemory.Alloc(1024);
     }
@@ -67,9 +72,10 @@ unsafe sealed class Server
                     case OpAccept: OnAccept(res, flags); break;
                     case OpRecv: OnRecv(fd, res); break;
                     case OpSend: OnSend(fd, res); break;
+                    case OpTimeout: _timeoutArmed = false; break;
                 }
             }
-            if (_readyCount > 0) RunBatch();
+            if (_readyCount > 0 || _writeCount > 0) RunBatch();
         }
     }
 
@@ -118,7 +124,11 @@ unsafe sealed class Server
     void Parse(int fd, Conn* c)
     {
         int r = Http.TryParse(c);
-        if (r > 0) _ready[_readyCount++] = fd;
+        if (r > 0)
+        {
+            if (c->Route is Route.CreatePost or Route.Like) _writes[_writeCount++] = fd;
+            else _ready[_readyCount++] = fd;
+        }
         else if (r == 0) PostRecv(fd, c);
         else CloseConn(fd, c);
     }
@@ -145,32 +155,45 @@ unsafe sealed class Server
     void RunBatch()
     {
         _now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        bool txn = _db.Begin();
-        bool anyWrite = false;
-        for (int i = 0; i < _readyCount; i++)
+        // Writes first, in their own BEGIN IMMEDIATE transaction (group commit). If the checkpointer holds the
+        // write lock right now (RESTART checkpoint), BEGIN fails at once (busy_timeout=0) and the writes wait
+        // for the next loop turn; a 1 ms timeout makes sure that turn comes. The event loop never blocks.
+        if (_writeCount > 0)
         {
-            Conn* c = &_conns[_ready[i]];
-            c->Wrote = 0;
-            Handle(c);
-            anyWrite |= c->Wrote != 0;
-        }
-        if (txn && !_db.Commit())
-        {
-            _db.Rollback();
-            if (anyWrite)
-                for (int i = 0; i < _readyCount; i++)
+            if (_db.BeginImmediate())
+            {
+                for (int i = 0; i < _writeCount; i++) Handle(&_conns[_writes[i]]);
+                if (!_db.Commit())
                 {
-                    Conn* c = &_conns[_ready[i]];
-                    if (c->Wrote != 0) { Out.Begin(c); Out.Error(500, "internal server error"u8); }
+                    _db.Rollback();
+                    for (int i = 0; i < _writeCount; i++) { Conn* c = &_conns[_writes[i]]; Out.Begin(c); Out.Error(500, "internal server error"u8); }
                 }
+                for (int i = 0; i < _writeCount; i++) QueueSend(_writes[i]);
+                _writeCount = 0;
+            }
+            else if (Defer() && !_timeoutArmed)
+            {
+                _ring.PrepTimeout(_timeout, OpTimeout);
+                _timeoutArmed = true;
+            }
         }
-        for (int i = 0; i < _readyCount; i++)
+        // Reads: one snapshot for the whole batch (they see the writes committed just above).
+        if (_readyCount > 0)
         {
-            int fd = _ready[i];
-            Conn* c = &_conns[fd];
-            _ring.PrepSend(fd, c->Out + c->OutStart, c->OutEnd - c->OutStart, (ulong)fd << 8 | OpSend);
+            bool txn = _db.Begin();
+            for (int i = 0; i < _readyCount; i++) Handle(&_conns[_ready[i]]);
+            if (txn) _db.Commit();
+            for (int i = 0; i < _readyCount; i++) QueueSend(_ready[i]);
+            _readyCount = 0;
         }
-        _readyCount = 0;
+    }
+
+    static bool Defer() { Log.Trace("write deferred"); return true; }
+
+    void QueueSend(int fd)
+    {
+        Conn* c = &_conns[fd];
+        _ring.PrepSend(fd, c->Out + c->OutStart, c->OutEnd - c->OutStart, (ulong)fd << 8 | OpSend);
     }
 
     void Handle(Conn* c)
@@ -264,7 +287,6 @@ unsafe sealed class Server
         Json.Trim(ref body, ref bodyLen);
         if (bodyLen == 0) { Out.Error(400, "body is required"u8); return; }
         if (Json.CodePoints(body, bodyLen) > 500) { Out.Error(400, "body must be at most 500 characters"u8); return; }
-        c->Wrote = 1;
         if (_db.InsertPost(userId, body, bodyLen, _name, nameLen)) Out.End(201);
         else { Out.Begin(c); Out.Error(500, "internal server error"u8); }
     }
@@ -274,7 +296,6 @@ unsafe sealed class Server
         if (!Auth(c, out long userId, out _)) return;
         long id = ParseId(c->In + c->SegOff, c->SegLen);
         if (id < 0) { Out.Error(400, "invalid post id"u8); return; }
-        c->Wrote = 1;
         int r = _db.Like(userId, id);
         switch (r)
         {
