@@ -6,7 +6,7 @@
 #   REV=<git rev> benches a committed revision instead of the working tree.
 set -euo pipefail
 VUS=${1:-20000}; SPEED=${2:-8}; HOLD=${3:-20s}
-SUB=csharp-iouring-MrRoza; HERE=/repo/submissions/$SUB/dev
+SUB=${SUB:-csharp-iouring-MrRoza}; HERE=/repo/submissions/csharp-iouring-MrRoza/dev   # SUB=<other> benches another entry
 mkdir -p /w/submissions "$HERE/out"
 [ -f /w/seed.db ] || cp /repo/seed/feed.db /w/seed.db
 if [ -n "${REV:-}" ]; then
@@ -14,14 +14,14 @@ if [ -n "${REV:-}" ]; then
   SRC=/w/rev/submissions/$SUB; DST=/w/submissions/rev
 else SRC=/repo/submissions/$SUB; DST=/w/submissions/$SUB; fi
 mkdir -p $DST; rm -rf $DST/src; cp -r $SRC/. $DST/
-( cd $DST && DEV=1 PROFILE=${PERF:-0} LOG=${LOG:-0} bash build.sh >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
+( cd $DST && if [ "$SUB" = csharp-iouring-MrRoza ]; then DEV=1 PROFILE=${PERF:-0} LOG=${LOG:-0} bash build.sh; else bash build.sh; fi >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
 # load.js with every think time divided by SPEED
 sed -e "s|sleep(between(\([^)]*\)))|sleep(between(\1) / $SPEED)|g" /repo/bench/load.js > /w/load-fast.js
 grep -c "/ $SPEED)" /w/load-fast.js >/dev/null
 rm -f /w/feed.db*; cp /w/seed.db /w/feed.db
 ulimit -n 1048576   # k6 needs one fd per VU
 # The server gets exactly the benchmark's LimitNOFILE.
-( ulimit -n 65535; SQLITE_PATH=/w/feed.db JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 exec taskset -c 0 $DST/bin/server >/w/server.log 2>&1 ) &
+( ulimit -n 65535; SQLITE_PATH=/w/feed.db JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 exec taskset -c 0 bash $DST/start.sh >/w/server.log 2>&1 ) &
 PID=$!
 trap 'kill $PID 2>/dev/null || true' EXIT
 for _ in $(seq 50); do curl -sf http://127.0.0.1:3000/health >/dev/null && break; sleep 0.1; done
