@@ -19,8 +19,9 @@ mkdir -p $DST; rm -rf $DST/src; cp -r $SRC/. $DST/
 sed -e "s|sleep(between(\([^)]*\)))|sleep(between(\1) / $SPEED)|g" /repo/bench/load.js > /w/load-fast.js
 grep -c "/ $SPEED)" /w/load-fast.js >/dev/null
 rm -f /w/feed.db*; cp /w/seed.db /w/feed.db
-ulimit -n 65535
-SQLITE_PATH=/w/feed.db JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 taskset -c 0 $DST/bin/server >/w/server.log 2>&1 &
+ulimit -n 1048576   # k6 needs one fd per VU
+# The server gets exactly the benchmark's LimitNOFILE.
+( ulimit -n 65535; SQLITE_PATH=/w/feed.db JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 exec taskset -c 0 $DST/bin/server >/w/server.log 2>&1 ) &
 PID=$!
 trap 'kill $PID 2>/dev/null || true' EXIT
 for _ in $(seq 50); do curl -sf http://127.0.0.1:3000/health >/dev/null && break; sleep 0.1; done
