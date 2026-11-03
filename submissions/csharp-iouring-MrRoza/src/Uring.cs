@@ -1,4 +1,6 @@
-// A minimal io_uring driven by the raw syscalls: one ring, one thread.
+// A minimal io_uring driven by the raw syscalls. Everything used here exists in Linux 6.1+ (the benchmark box
+// runs Ubuntu 24.04's 6.8): DEFER_TASKRUN, direct descriptors, multishot poll, EXT_ARG waits. No buffer rings
+// (Ubuntu's 6.8.0-136+ kernels refuse some buffer-ring registrations).
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -18,7 +20,7 @@ unsafe struct Sqe
     [FieldOffset(32)] public ulong UserData;
     [FieldOffset(40)] public ushort BufIndex;
     [FieldOffset(42)] public ushort Personality;
-    [FieldOffset(44)] public int SpliceFdIn;
+    [FieldOffset(44)] public uint FileIndex; // splice_fd_in / file_index
     [FieldOffset(48)] public ulong Addr3;
     [FieldOffset(56)] public ulong Pad;
 }
@@ -46,43 +48,48 @@ unsafe struct UringParams
 
 unsafe sealed class Uring
 {
-    public const byte OP_TIMEOUT = 11, OP_ACCEPT = 13, OP_CLOSE = 19, OP_SEND = 26, OP_RECV = 27;
-    public const ushort ACCEPT_MULTISHOT = 1;
+    public const byte OP_POLL_ADD = 6, OP_TIMEOUT = 11, OP_ACCEPT = 13, OP_CLOSE = 19, OP_SEND = 26, OP_RECV = 27, OP_SHUTDOWN = 34;
+    public const byte SQE_FIXED_FILE = 1, SQE_IO_LINK = 4, SQE_IO_HARDLINK = 8, SQE_CQE_SKIP_SUCCESS = 64;
     public const uint CQE_F_MORE = 2;
-    const uint SETUP_CQSIZE = 1 << 3, SETUP_SUBMIT_ALL = 1 << 7, SETUP_COOP_TASKRUN = 1 << 8,
+    const uint POLL_ADD_MULTI = 1, FILE_INDEX_ALLOC = 0xFFFFFFFF;
+    const uint SETUP_CQSIZE = 1 << 3, SETUP_SUBMIT_ALL = 1 << 7, SETUP_COOP_TASKRUN = 1 << 8, SETUP_TASKRUN_FLAG = 1 << 9,
                SETUP_SINGLE_ISSUER = 1 << 12, SETUP_DEFER_TASKRUN = 1 << 13;
-    const uint ENTER_GETEVENTS = 1;
-    const long OFF_SQ_RING = 0, OFF_CQ_RING = 0x8000000, OFF_SQES = 0x10000000;
+    const uint ENTER_GETEVENTS = 1, ENTER_EXT_ARG = 1 << 3;
+    const long OFF_SQ_RING = 0, OFF_SQES = 0x10000000;
+    const uint REGISTER_FILES = 2, REGISTER_EVENTFD = 4;
 
-    readonly int _fd;
-    readonly uint* _sqHead, _sqTail, _cqHead, _cqTail;
+    public readonly int Fd;
+    readonly uint* _sqHead, _sqTail, _cqHead, _cqTail, _sqFlags;
     readonly uint _sqMask, _cqMask, _sqEntries;
     readonly Sqe* _sqes;
     readonly Cqe* _cqes;
-    uint _sqTailLocal; // our private tail; published on Submit
+    uint _sqTailLocal; // our private tail; published on submit
     uint _toSubmit;
+    // io_uring_getevents_arg + __kernel_timespec for EXT_ARG waits.
+    readonly ulong* _waitArg = (ulong*)NativeMemory.AllocZeroed(48);
 
     public Uring(uint entries, uint cqEntries)
     {
         UringParams p = default;
-        p.Flags = SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_COOP_TASKRUN | SETUP_SINGLE_ISSUER | SETUP_DEFER_TASKRUN;
+        p.Flags = SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_COOP_TASKRUN | SETUP_TASKRUN_FLAG | SETUP_SINGLE_ISSUER | SETUP_DEFER_TASKRUN;
         p.CqEntries = cqEntries;
         long fd = Libc.syscall(Libc.SYS_io_uring_setup, entries, (long)&p, 0, 0, 0, 0);
         if (fd < 0) throw new Exception("io_uring_setup failed: errno " + Libc.Errno);
-        _fd = (int)fd;
+        Fd = (int)fd;
 
-        // FEAT_SINGLE_MMAP is in every kernel we care about (5.4+): SQ and CQ rings share one mapping.
+        // FEAT_SINGLE_MMAP (5.4+): SQ and CQ rings share one mapping.
         nuint sqSize = p.SqArray + p.SqEntries * 4;
         nuint cqSize = p.CqCqes + p.CqEntries * (uint)sizeof(Cqe);
         nuint ringSize = sqSize > cqSize ? sqSize : cqSize;
-        byte* ring = (byte*)Libc.mmap(null, ringSize, Libc.PROT_READ | Libc.PROT_WRITE, Libc.MAP_SHARED | Libc.MAP_POPULATE, _fd, OFF_SQ_RING);
+        byte* ring = (byte*)Libc.mmap(null, ringSize, Libc.PROT_READ | Libc.PROT_WRITE, Libc.MAP_SHARED | Libc.MAP_POPULATE, Fd, OFF_SQ_RING);
         if (ring == (byte*)-1) throw new Exception("mmap ring failed");
-        _sqes = (Sqe*)Libc.mmap(null, p.SqEntries * (nuint)sizeof(Sqe), Libc.PROT_READ | Libc.PROT_WRITE, Libc.MAP_SHARED | Libc.MAP_POPULATE, _fd, OFF_SQES);
+        _sqes = (Sqe*)Libc.mmap(null, p.SqEntries * (nuint)sizeof(Sqe), Libc.PROT_READ | Libc.PROT_WRITE, Libc.MAP_SHARED | Libc.MAP_POPULATE, Fd, OFF_SQES);
         if (_sqes == (Sqe*)-1) throw new Exception("mmap sqes failed");
 
         _sqHead = (uint*)(ring + p.SqHead);
         _sqTail = (uint*)(ring + p.SqTail);
         _sqMask = *(uint*)(ring + p.SqRingMask);
+        _sqFlags = (uint*)(ring + p.SqFlags);
         _sqEntries = p.SqEntries;
         _cqHead = (uint*)(ring + p.CqHead);
         _cqTail = (uint*)(ring + p.CqTail);
@@ -95,11 +102,29 @@ unsafe sealed class Uring
         _sqTailLocal = *_sqTail;
     }
 
+    /// <summary>Registers a sparse direct-descriptor table of <paramref name="slots"/> entries.</summary>
+    public void RegisterSparseFiles(int slots)
+    {
+        int* fds = (int*)NativeMemory.Alloc((nuint)slots, 4);
+        for (int i = 0; i < slots; i++) fds[i] = -1;
+        long r = Libc.syscall(Libc.SYS_io_uring_register, Fd, REGISTER_FILES, (long)fds, slots, 0, 0);
+        NativeMemory.Free(fds);
+        if (r < 0) throw new Exception("IORING_REGISTER_FILES failed: errno " + Libc.Errno);
+    }
+
+    public void RegisterEventFd(int efd)
+    {
+        long r = Libc.syscall(Libc.SYS_io_uring_register, Fd, REGISTER_EVENTFD, (long)&efd, 1, 0, 0);
+        if (r < 0) throw new Exception("IORING_REGISTER_EVENTFD failed: errno " + Libc.Errno);
+    }
+
+    public bool HasPending => _toSubmit > 0;
+
     /// <summary>Next free SQE, zeroed. Submits first if the ring is full.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Sqe* GetSqe()
     {
-        if (_sqTailLocal - Volatile.Read(ref *_sqHead) >= _sqEntries) Submit(0);
+        if (_sqTailLocal - Volatile.Read(ref *_sqHead) >= _sqEntries) Enter(0, 0);
         Sqe* s = &_sqes[_sqTailLocal & _sqMask];
         *s = default;
         _sqTailLocal++;
@@ -107,50 +132,33 @@ unsafe sealed class Uring
         return s;
     }
 
-    /// <summary>Publishes queued SQEs and optionally waits for at least <paramref name="wait"/> completions.</summary>
-    public int Submit(uint wait)
-    {
-        Volatile.Write(ref *_sqTail, _sqTailLocal);
-        uint n = _toSubmit;
-        // DEFER_TASKRUN: completions are only produced inside io_uring_enter with GETEVENTS, so always pass it.
-        long r = Libc.syscall(Libc.SYS_io_uring_enter, _fd, n, wait, ENTER_GETEVENTS, 0, 0);
-        if (r < 0)
-        {
-            int e = Libc.Errno;
-            if (e == 4 /*EINTR*/ || e == 16 /*EBUSY*/ || e == 11 /*EAGAIN*/) return 0;
-            throw new Exception("io_uring_enter failed: errno " + e);
-        }
-        _toSubmit -= (uint)r > n ? n : (uint)r;
-        return (int)r;
-    }
-
-    // io_uring_getevents_arg + __kernel_timespec for IORING_ENTER_EXT_ARG (kernel 5.11+).
-    readonly ulong* _waitArg = (ulong*)System.Runtime.InteropServices.NativeMemory.AllocZeroed(48);
-    const uint ENTER_EXT_ARG = 1 << 3;
-
     /// <summary>
-    /// Publishes queued SQEs, then waits until <paramref name="wait"/> completions are ready or
-    /// <paramref name="timeoutNs"/> has passed, whichever comes first.
+    /// Publishes queued SQEs and runs pending task work (DEFER_TASKRUN only posts completions inside
+    /// io_uring_enter with GETEVENTS). Waits for <paramref name="wait"/> completions, at most
+    /// <paramref name="timeoutNs"/> if that is positive.
     /// </summary>
-    public int SubmitAndWaitTimeout(uint wait, long timeoutNs)
+    public void Enter(uint wait, long timeoutNs)
     {
         Volatile.Write(ref *_sqTail, _sqTailLocal);
         uint n = _toSubmit;
-        long* ts = (long*)(_waitArg + 3);
-        ts[0] = timeoutNs / 1_000_000_000; ts[1] = timeoutNs % 1_000_000_000;
-        _waitArg[0] = 0; _waitArg[1] = 0; _waitArg[2] = (ulong)ts; // sigmask, sigmask_sz|pad, ts
-        long r = Libc.syscall(Libc.SYS_io_uring_enter, _fd, n, wait, ENTER_GETEVENTS | ENTER_EXT_ARG, (long)_waitArg, 24);
+        long r;
+        if (timeoutNs > 0 && wait > 0)
+        {
+            long* ts = (long*)(_waitArg + 3);
+            ts[0] = timeoutNs / 1_000_000_000; ts[1] = timeoutNs % 1_000_000_000;
+            _waitArg[0] = 0; _waitArg[1] = 0; _waitArg[2] = (ulong)ts; // sigmask, sigmask_sz|pad, ts
+            r = Libc.syscall(Libc.SYS_io_uring_enter, Fd, n, wait, ENTER_GETEVENTS | ENTER_EXT_ARG, (long)_waitArg, 24);
+        }
+        else r = Libc.syscall(Libc.SYS_io_uring_enter, Fd, n, wait, ENTER_GETEVENTS, 0, 0);
         if (r < 0)
         {
             int e = Libc.Errno;
-            if (e == 62 /*ETIME*/ || e == 4 /*EINTR*/ || e == 16 /*EBUSY*/ || e == 11 /*EAGAIN*/) return 0;
+            if (e == 62 /*ETIME*/ || e == 4 /*EINTR*/ || e == 16 /*EBUSY*/ || e == 11 /*EAGAIN*/) return;
             throw new Exception("io_uring_enter failed: errno " + e);
         }
         _toSubmit -= (uint)r > n ? n : (uint)r;
-        return (int)r;
     }
 
-    /// <summary>Peeks the next completion. Call <see cref="Advance"/> after handling it.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPeek(out Cqe* cqe)
     {
@@ -160,37 +168,62 @@ unsafe sealed class Uring
         return true;
     }
 
+    /// <summary>
+    /// The kernel has deferred task work queued for this ring (TASKRUN_FLAG). Newer kernels run only part of it
+    /// per enter, and a DEFER_TASKRUN ring signals its eventfd only when its work list goes from empty to
+    /// non-empty, so sleeping in epoll while this is set can sleep forever.
+    /// </summary>
+    public bool TaskRunPending => (Volatile.Read(ref *_sqFlags) & 2 /*IORING_SQ_TASKRUN*/) != 0;
+
+    public uint ReadyCount => Volatile.Read(ref *_cqTail) - *_cqHead;
+
+    public bool HasCompletions => *_cqHead != Volatile.Read(ref *_cqTail);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Advance() => Volatile.Write(ref *_cqHead, *_cqHead + 1);
 
-    public void PrepAcceptMultishot(int listenFd, ulong userData)
+    /// <summary>One-shot accept into a free slot of this ring's direct-descriptor table (CQE res = slot).</summary>
+    public void PrepAcceptDirect(int listenFd, ulong userData)
     {
         Sqe* s = GetSqe();
-        s->Opcode = OP_ACCEPT; s->Fd = listenFd; s->Ioprio = ACCEPT_MULTISHOT; s->UserData = userData;
+        s->Opcode = OP_ACCEPT; s->Fd = listenFd; s->FileIndex = FILE_INDEX_ALLOC; s->UserData = userData;
     }
 
-    public void PrepRecv(int fd, byte* buf, int len, ulong userData)
+    /// <summary>Multishot POLLIN on a direct descriptor: one CQE every time data arrives, no buffer held.</summary>
+    public void PrepPollMulti(int slot, ulong userData)
     {
         Sqe* s = GetSqe();
-        s->Opcode = OP_RECV; s->Fd = fd; s->Addr = (ulong)buf; s->Len = (uint)len; s->UserData = userData;
+        s->Opcode = OP_POLL_ADD; s->Fd = slot; s->Flags = SQE_FIXED_FILE; s->Len = POLL_ADD_MULTI;
+        s->OpFlags = 0x001 /*POLLIN*/ | 0x2000 /*POLLRDHUP*/; s->UserData = userData;
     }
 
-    public void PrepSend(int fd, byte* buf, int len, ulong userData)
+    public void PrepRecv(int slot, byte* buf, int len, ulong userData)
     {
         Sqe* s = GetSqe();
-        s->Opcode = OP_SEND; s->Fd = fd; s->Addr = (ulong)buf; s->Len = (uint)len;
+        s->Opcode = OP_RECV; s->Fd = slot; s->Flags = SQE_FIXED_FILE; s->Addr = (ulong)buf; s->Len = (uint)len;
+        s->OpFlags = 0x40; /* MSG_DONTWAIT: the poll said it's readable; never park a buffer */ s->UserData = userData;
+    }
+
+    public void PrepSend(int slot, byte* buf, int len, ulong userData)
+    {
+        Sqe* s = GetSqe();
+        s->Opcode = OP_SEND; s->Fd = slot; s->Flags = SQE_FIXED_FILE; s->Addr = (ulong)buf; s->Len = (uint)len;
         s->OpFlags = 0x4000; /* MSG_NOSIGNAL */ s->UserData = userData;
+    }
+
+    /// <summary>SHUTDOWN hard-linked to CLOSE of the slot: the shutdown ends the multishot poll, the close frees the slot.</summary>
+    public void PrepShutdownClose(int slot, ulong userData)
+    {
+        Sqe* s = GetSqe();
+        s->Opcode = OP_SHUTDOWN; s->Fd = slot; s->Flags = SQE_FIXED_FILE | SQE_IO_HARDLINK | SQE_CQE_SKIP_SUCCESS;
+        s->Len = 2; /* SHUT_RDWR */ s->UserData = userData;
+        s = GetSqe();
+        s->Opcode = OP_CLOSE; s->FileIndex = (uint)slot + 1; s->UserData = userData;
     }
 
     public void PrepTimeout(long* ts, ulong userData)
     {
         Sqe* s = GetSqe();
         s->Opcode = OP_TIMEOUT; s->Fd = -1; s->Addr = (ulong)ts; s->Len = 1; s->UserData = userData;
-    }
-
-    public void PrepClose(int fd, ulong userData)
-    {
-        Sqe* s = GetSqe();
-        s->Opcode = OP_CLOSE; s->Fd = fd; s->UserData = userData;
     }
 }
