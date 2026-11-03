@@ -35,14 +35,16 @@ publish() { # <sqlite lib> <output dir> [extra msbuild args]
 if [ "${PGO:-1}" = 1 ]; then
   # Profile-guided SQLite: an instrumented build runs `server --train` (a synthetic database of its own random
   # data and the load test's request mix, in-process; see src/Trainer.cs), then SQLite + shim are compiled
-  # again with the profile. Both compiles write the same object path, so the profile matches it.
+  # again with the profile. Both compiles write the same object path, so the profile matches it. The checkpoint
+  # thread runs SQLite code too: atomic counters, and -fprofile-correction for what still races.
   OUT=obj/sqlite-pgo; PGODIR="$PWD/obj/pgo-data"
   if [ ! -f "$OUT/libsqlite3.a" ] || [ native/shim.c -nt "$OUT/libsqlite3.a" ] || [ src/Trainer.cs -nt "$OUT/libsqlite3.a" ]; then
     rm -rf "$PGODIR" obj/pgo-train
-    sqlite_lib "$OUT" -fprofile-generate -fprofile-update=single -fprofile-dir="$PGODIR"
+    sqlite_lib "$OUT" -fprofile-generate -fprofile-update=atomic -fprofile-dir="$PGODIR"
     publish "$OUT/libsqlite3.a" obj/pgo-train -p:PgoGen=true
     if obj/pgo-train/server --train obj/pgo-train/db; then
-      sqlite_lib "$OUT" -fprofile-use -fprofile-dir="$PGODIR" -fprofile-partial-training -Wno-missing-profile
+      sqlite_lib "$OUT" -fprofile-use -fprofile-correction -fprofile-dir="$PGODIR" -fprofile-partial-training -Wno-missing-profile \
+        || { echo "PGO compile failed; plain build" >&2; sqlite_lib "$OUT"; }
     else
       echo "PGO training failed; plain build" >&2
       sqlite_lib "$OUT"
