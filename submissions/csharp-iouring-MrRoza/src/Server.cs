@@ -53,6 +53,7 @@ unsafe sealed partial class Server
     int _readyCount, _writeCount;
     readonly long* _timeout;          // __kernel_timespec for the write-retry timeout
     bool _timeoutArmed;
+    long _writeOldest;                // Stopwatch timestamp of the oldest queued write
     readonly long _startTicks = Environment.TickCount64;
     long _now;                        // unix seconds, refreshed per batch
     readonly byte* _scratch, _name;
@@ -61,6 +62,11 @@ unsafe sealed partial class Server
     // Dev tunables (not part of the runtime contract; start.sh never sets them).
     static readonly uint BatchMin = uint.Parse(Environment.GetEnvironmentVariable("TWELVE_BATCH_MIN") ?? "128");
     static readonly long BatchWaitNs = long.Parse(Environment.GetEnvironmentVariable("TWELVE_BATCH_WAIT_US") ?? "2000") * 1000;
+    // The write stage: queued writes commit together once WriteMin are queued or the oldest waited WriteWaitUs.
+    // Every commit rewrites the same hot pages (newest posts leaf, index leaves) into the WAL, so fewer,
+    // bigger commits write far fewer frames per row.
+    static readonly int WriteMin = int.Parse(Environment.GetEnvironmentVariable("TWELVE_WRITE_MIN") ?? "64");
+    static readonly long WriteWaitTicks = long.Parse(Environment.GetEnvironmentVariable("TWELVE_WRITE_WAIT_US") ?? "5000") * Stopwatch.Frequency / 1_000_000;
     static readonly int SlotsOverride = int.Parse(Environment.GetEnvironmentVariable("TWELVE_RING_SLOTS") ?? "0");
 
     public Server(int listenFd, Db db)
@@ -276,7 +282,11 @@ unsafe sealed partial class Server
         if (r > 0)
         {
             c->State = ConnState.Queued;
-            if (c->Route is Route.CreatePost or Route.Like) _writes[_writeCount++] = idx;
+            if (c->Route is Route.CreatePost or Route.Like)
+            {
+                if (_writeCount == 0) _writeOldest = Stopwatch.GetTimestamp();
+                _writes[_writeCount++] = idx;
+            }
             else _ready[_readyCount++] = idx;
         }
         else if (r == 0) StartRecv(idx, c); // the rest may already be there; if not, EAGAIN and the poll tells us
@@ -334,7 +344,7 @@ unsafe sealed partial class Server
         // Writes first, in their own BEGIN IMMEDIATE transaction (group commit). If the checkpointer holds the
         // write lock right now (RESTART checkpoint), BEGIN fails at once (busy_timeout=0) and the writes wait
         // for the next loop turn; a 1 ms timeout makes sure that turn comes. The event loop never blocks.
-        if (_writeCount > 0)
+        if (_writeCount > 0 && (_writeCount >= WriteMin || Stopwatch.GetTimestamp() - _writeOldest >= WriteWaitTicks))
         {
             if (_db.BeginImmediate())
             {
