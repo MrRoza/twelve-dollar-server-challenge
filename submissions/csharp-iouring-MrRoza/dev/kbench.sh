@@ -14,7 +14,7 @@ if [ -n "${REV:-}" ]; then
   SRC=/w/rev/submissions/$SUB; DST=/w/submissions/rev
 else SRC=/repo/submissions/$SUB; DST=/w/submissions/$SUB; fi
 mkdir -p $DST; rm -rf $DST/src; cp -r $SRC/. $DST/
-( cd $DST && PROFILE=${PERF:-0} LOG=${LOG:-0} bash build.sh >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
+( cd $DST && DEV=1 PROFILE=${PERF:-0} LOG=${LOG:-0} bash build.sh >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
 # load.js with every think time divided by SPEED
 sed -e "s|sleep(between(\([^)]*\)))|sleep(between(\1) / $SPEED)|g" /repo/bench/load.js > /w/load-fast.js
 grep -c "/ $SPEED)" /w/load-fast.js >/dev/null

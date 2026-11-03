@@ -188,8 +188,9 @@ static unsafe class Jwt
         var pay = new JsonFields();
         if (!Json.ParseObject(buf, pl, ref pay, scratch, 3072)) return Result.Invalid;
 
+        // exp is required: SPEC says verify it, so a token without one is rejected.
         int ei = pay.Find("exp"u8);
-        if (ei >= 0)
+        if (ei < 0) return Result.Invalid;
         {
             if (pay.Kind(ei) != JsonKind.Number) return Result.Invalid;
             if (!double.TryParse(pay.Raw(ei), NumberStyles.Float, CultureInfo.InvariantCulture, out double exp)) return Result.Invalid;

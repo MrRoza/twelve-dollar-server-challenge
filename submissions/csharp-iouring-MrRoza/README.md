@@ -134,5 +134,5 @@ bash dev/docker.sh run 'bash submissions/csharp-iouring-MrRoza/dev/kbench.sh 200
 
 `kbench.sh` runs the official `bench/load.js` with every think time divided by a speed factor. That's an open
 loop with one connection per user, like the real run. The server is pinned to one core and the script reports
-its CPU µs per request. `TWELVE_*` environment variables exist only for these experiments. `start.sh` never
-sets them, and the defaults are the values above.
+its CPU µs per request. `TWELVE_*` environment variables are read only by a `DEV=1` build for these experiments. The submission
+build has the values above compiled in.
