@@ -110,6 +110,25 @@ decodes the record bytes and writes the JSON. There's no bytecode engine and no 
 - **Trace logging** is compiled in only with `LOG=1 bash build.sh` (`[Conditional("TRACE_LOG")]`: without it,
   the calls *and their arguments* don't exist in the binary). It prints per-second loop stats and checkpoints.
 
+## Credits
+
+The staged pipeline (collect window, write stage, read stage) is this entry's own idea. Much of the rest was
+learned from other submissions. Thanks to their authors for documenting it so well:
+
+- **[rust-iouring-kensac](../rust-iouring-kensac)** (#248, #264):
+  - multishot recv into a provided-buffer ring, and the `resv[0]=1` retry for Ubuntu 6.8's buffer-ring bug
+  - several `SO_REUSEPORT` listeners and 512 accepts in flight for the ramp
+  - draining sockets through a bounded queue after a burst instead of re-arming every recv
+  - waiting on several rings: one non-blocking enter per other ring, then a wait on ring 0
+  - the feed plan on B-tree cursors (index walk, ascending id lookups, one likes range walk when the ids are
+    within 512), which our `Bt.cs` follows closely
+- **[c-iouring-pavlyhalim](../c-iouring-pavlyhalim)** (#245) and the other top entries: reading SQLite's
+  B-tree cursors through a shim that `#include`s the unmodified amalgamation, inside one read transaction per
+  batch.
+- The C# io_uring entries ([csharp-iouring-oswaldosierra](../csharp-iouring-oswaldosierra),
+  [csharp-iouring-AlexandruLT](../csharp-iouring-AlexandruLT),
+  [csharp-iouring-jit-gichamba](../csharp-iouring-jit-gichamba)), for seeing how far C# goes on this box.
+
 ## Layout
 
 ```
