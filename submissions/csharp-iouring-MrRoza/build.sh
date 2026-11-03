@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds as a normal user: SQLite from checksummed source (static), then the NativeAOT server.
 #   LOG=1 bash build.sh      -> compiles the trace logging in (off by default: the calls don't exist in the binary)
+#   DEV=1 bash build.sh      -> reads TWELVE_* tunables from the environment (dev experiments only)
 #   PROFILE=1 bash build.sh  -> SQLite's internal functions get global symbols so perf can name them (dev only)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -25,4 +26,5 @@ if [ ! -f "$OUT/libsqlite3.a" ] || [ native/shim.c -nt "$OUT/libsqlite3.a" ]; th
 fi
 
 LOGFLAG=false; [ "${LOG:-0}" = 1 ] && LOGFLAG=true
-dotnet publish Server.csproj -c Release -p:RestoreLockedMode=true -p:Log=$LOGFLAG -p:SqliteLib=$OUT/libsqlite3.a -o bin
+DEVFLAG=false; [ "${DEV:-0}" = 1 ] && DEVFLAG=true   # DEV=1: TWELVE_* env tunables (experiments only)
+dotnet publish Server.csproj -c Release -p:RestoreLockedMode=true -p:Log=$LOGFLAG -p:Dev=$DEVFLAG -p:SqliteLib=$OUT/libsqlite3.a -o bin

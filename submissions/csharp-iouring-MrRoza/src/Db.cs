@@ -11,7 +11,8 @@ unsafe sealed class Db
     readonly nint _begin, _beginImmediate, _commit, _rollback, _health, _feed, _post, _insertPost, _postExists, _insertLike;
     readonly nint _feedIds, _feedLikes, _feedRows, _touch;
     BtReader? _bt;                 // B-tree reads; null = SQL only
-    bool _readOpen;                // the batch's read transaction has started (a statement ran in it)
+    bool _readOpen;
+    bool _inRead;                  // Begin() succeeded for this batch                // the batch's read transaction has started (a statement ran in it)
     readonly byte* _feedScratch = (byte*)NativeMemory.Alloc(FeedScratchSize);
     const int FeedScratchSize = 1 << 18; // 20 posts x 500 chars x 6 bytes worst-case escaping, with room to spare
     const int FeedRangeMax = 512;
@@ -27,7 +28,7 @@ unsafe sealed class Db
         Exec(_db, "PRAGMA synchronous=NORMAL");
         Exec(_db, "PRAGMA wal_autocheckpoint=0"); // the checkpoint thread does it, off the request path
         Exec(_db, "PRAGMA cache_size=-262144");    // 256 MB page cache
-        Exec(_db, "PRAGMA mmap_size=" + (Environment.GetEnvironmentVariable("TWELVE_MMAP") ?? "536870912"));
+        Exec(_db, "PRAGMA mmap_size=" + Tune.Get("MMAP", 536870912));
         Exec(_db, "PRAGMA temp_store=MEMORY");
         Exec(_db, "PRAGMA busy_timeout=0"); // never block the event loop: a busy write retries next turn
         _begin = Prep("BEGIN");
@@ -87,12 +88,13 @@ unsafe sealed class Db
         return rc == Sqlite.DONE || rc == Sqlite.ROW;
     }
 
-    public bool Begin() { _readOpen = false; return Run(_begin); }
+    public bool Begin() { _readOpen = false; _inRead = Run(_begin); return _inRead; }
 
     /// <summary>Ends the batch's read transaction (B-tree cursors are closed first).</summary>
     public bool EndRead()
     {
         _bt?.Close();
+        _inRead = false;
         return Run(_commit);
     }
 
@@ -100,7 +102,7 @@ unsafe sealed class Db
     /// until COMMIT because we are inside BEGIN).</summary>
     bool BtReady()
     {
-        if (_bt == null) return false;
+        if (_bt == null || !_inRead) return false; // no read transaction: SQL path only
         if (!_readOpen) { if (!Run(_touch)) return false; _readOpen = true; }
         return true;
     }
@@ -354,8 +356,8 @@ unsafe sealed class Db
     /// </summary>
     public static void StartCheckpointer(string path)
     {
-        int RestartFrames = int.Parse(Environment.GetEnvironmentVariable("TWELVE_CKPT_RESTART") ?? "20000");
-        int PeriodMs = int.Parse(Environment.GetEnvironmentVariable("TWELVE_CKPT_MS") ?? "250");
+        int RestartFrames = (int)Tune.Get("CKPT_RESTART", 20000);
+        int PeriodMs = (int)Tune.Get("CKPT_MS", 250);
         var t = new Thread(() =>
         {
             nint db = Open(path);

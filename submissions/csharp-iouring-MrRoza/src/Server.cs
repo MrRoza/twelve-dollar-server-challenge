@@ -59,15 +59,15 @@ unsafe sealed partial class Server
     readonly byte* _scratch, _name;
     readonly BufPool _inPool = new(InPoolSize), _outPool = new(OutPoolSize);
 
-    // Dev tunables (not part of the runtime contract; start.sh never sets them).
-    static readonly uint BatchMin = uint.Parse(Environment.GetEnvironmentVariable("TWELVE_BATCH_MIN") ?? "128");
-    static readonly long BatchWaitNs = long.Parse(Environment.GetEnvironmentVariable("TWELVE_BATCH_WAIT_US") ?? "2000") * 1000;
+    // Tunables: compile-time defaults (see Tune.cs).
+    static readonly uint BatchMin = (uint)Tune.Get("BATCH_MIN", 128);
+    static readonly long BatchWaitNs = Tune.Get("BATCH_WAIT_US", 2000) * 1000;
     // The write stage: queued writes commit together once WriteMin are queued or the oldest waited WriteWaitUs.
     // Every commit rewrites the same hot pages (newest posts leaf, index leaves) into the WAL, so fewer,
     // bigger commits write far fewer frames per row.
-    static readonly int WriteMin = int.Parse(Environment.GetEnvironmentVariable("TWELVE_WRITE_MIN") ?? "64");
-    static readonly long WriteWaitTicks = long.Parse(Environment.GetEnvironmentVariable("TWELVE_WRITE_WAIT_US") ?? "5000") * Stopwatch.Frequency / 1_000_000;
-    static readonly int SlotsOverride = int.Parse(Environment.GetEnvironmentVariable("TWELVE_RING_SLOTS") ?? "0");
+    static readonly int WriteMin = (int)Tune.Get("WRITE_MIN", 64);
+    static readonly long WriteWaitTicks = Tune.Get("WRITE_WAIT_US", 5000) * Stopwatch.Frequency / 1_000_000;
+    static readonly int SlotsOverride = (int)Tune.Get("RING_SLOTS", 0);
 
     public Server(int listenFd, Db db)
     {

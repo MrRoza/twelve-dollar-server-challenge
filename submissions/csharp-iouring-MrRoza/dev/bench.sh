@@ -11,7 +11,7 @@ mkdir -p /w/submissions "$HERE/out"
 [ -f /w/tokens.txt ] || jq -r '.[0:5000][].token' /repo/seed/tokens.json > /w/tokens.txt
 SRC=${SRC:-/repo/submissions/$SUB}; DST=/w/submissions/${SUBDIR:-$SUB}
 mkdir -p $DST; rm -rf $DST/src; cp -r $SRC/. $DST/
-( cd $DST && PROFILE=$PERF LOG=${LOG:-0} bash build.sh >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
+( cd $DST && DEV=1 PROFILE=$PERF LOG=${LOG:-0} bash build.sh >/w/build.log 2>&1 ) || { tail -30 /w/build.log; exit 1; }
 rm -f /w/feed.db*; cp /w/seed.db /w/feed.db
 ulimit -n 65535
 SQLITE_PATH=/w/feed.db JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 \

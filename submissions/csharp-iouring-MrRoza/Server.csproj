@@ -28,6 +28,11 @@
     <DefineConstants>$(DefineConstants);TRACE_LOG</DefineConstants>
   </PropertyGroup>
 
+  <!-- dotnet publish -p:Dev=true reads TWELVE_* tunables from the environment (experiments only). -->
+  <PropertyGroup Condition="'$(Dev)' == 'true'">
+    <DefineConstants>$(DefineConstants);DEV_TUNABLES</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <DirectPInvoke Include="sqlite3" />
     <NativeLibrary Include="$(SqliteLib)" />
