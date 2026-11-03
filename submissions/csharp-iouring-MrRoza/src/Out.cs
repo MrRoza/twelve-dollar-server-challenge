@@ -11,9 +11,12 @@ static unsafe class Out
     static Conn* _c;
     static byte* _p, _end;
 
+    public const int PoolSize = 16384;
+    public static BufPool Pool = null!;
+
     public static void Begin(Conn* c)
     {
-        if (c->Out == null) { c->OutCap = 16384; c->Out = (byte*)NativeMemory.Alloc((nuint)c->OutCap); }
+        if (c->Out == null) { c->Out = Pool.Take(); c->OutCap = PoolSize; }
         _c = c;
         _p = c->Out + HeaderRoom;
         _end = c->Out + c->OutCap;
@@ -33,7 +36,14 @@ static unsafe class Out
         int used = (int)(_p - _c->Out);
         int cap = _c->OutCap;
         while (cap - used < need) cap *= 2;
-        _c->Out = (byte*)NativeMemory.Realloc(_c->Out, (nuint)cap);
+        if (_c->OutCap == PoolSize)
+        {
+            byte* nb = (byte*)NativeMemory.Alloc((nuint)cap);
+            Buffer.MemoryCopy(_c->Out, nb, cap, used);
+            Pool.Return(_c->Out);
+            _c->Out = nb;
+        }
+        else _c->Out = (byte*)NativeMemory.Realloc(_c->Out, (nuint)cap);
         _c->OutCap = cap;
         _p = _c->Out + used;
         _end = _c->Out + cap;

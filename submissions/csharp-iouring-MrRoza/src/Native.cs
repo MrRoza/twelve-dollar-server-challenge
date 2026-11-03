@@ -22,6 +22,14 @@ static unsafe class Libc
     [DllImport("libc")] public static extern int* __errno_location();
     [DllImport("libc")] public static extern nint write(int fd, byte* buf, nuint n);
 
+    [DllImport("libc")] public static extern int getrlimit(int resource, ulong* rlim);
+    [DllImport("libc")] public static extern int epoll_create1(int flags);
+    [DllImport("libc")] public static extern int epoll_ctl(int epfd, int op, int fd, byte* ev);
+    [DllImport("libc")] public static extern int epoll_wait(int epfd, byte* events, int max, int timeoutMs);
+    [DllImport("libc")] public static extern int eventfd(uint initval, int flags);
+    [DllImport("libc")] public static extern nint read(int fd, void* buf, nuint n);
+    [DllImport("libc")] public static extern int usleep(uint usec);
+
     public static int Errno => *__errno_location();
 }
 
