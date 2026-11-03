@@ -16,7 +16,7 @@ echo "$SQLITE_SHA256  $SRC/$SQLITE.tar.gz" | sha256sum -c -
 [ -f "$SRC/sqlite3.c" ] || tar -xzf "$SRC/$SQLITE.tar.gz" -C "$SRC" --strip-components=1 "$SQLITE/sqlite3.c" "$SQLITE/sqlite3.h"
 
 EXTRA=()
-[ "${PROFILE:-0}" = 1 ] && EXTRA=(-DSQLITE_PRIVATE= -fno-omit-frame-pointer)
+[ "${PROFILE:-0}" = 1 ] && EXTRA=(-DSQLITE_PRIVATE= -fno-omit-frame-pointer -g)
 # native/shim.c #includes the unmodified amalgamation and adds B-tree cursor wrappers (one translation unit).
 sqlite_lib() { # <dir> <extra gcc flags...>: compiles $1/sqlite3.o into $1/libsqlite3.a
   local dir=$1; shift
@@ -29,7 +29,8 @@ LOGFLAG=false; [ "${LOG:-0}" = 1 ] && LOGFLAG=true
 DEVFLAG=false; [ "${DEV:-0}" = 1 ] && DEVFLAG=true   # DEV=1: TWELVE_* env tunables (experiments only)
 publish() { # <sqlite lib> <output dir> [extra msbuild args]
   local lib=$1 out=$2; shift 2
-  dotnet publish Server.csproj -c Release -p:RestoreLockedMode=true -p:Log=$LOGFLAG -p:Dev=$DEVFLAG -p:SqliteLib="$lib" -o "$out" "$@"
+  local keep=false; [ "${PROFILE:-0}" = 1 ] && keep=true
+  dotnet publish Server.csproj -c Release -p:RestoreLockedMode=true -p:Log=$LOGFLAG -p:Dev=$DEVFLAG -p:KeepLocals=$keep     -p:SqliteLib="$lib" -o "$out" "$@"
 }
 
 if [ "${PGO:-1}" = 1 ]; then

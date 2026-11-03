@@ -38,6 +38,8 @@
     <NativeLibrary Include="$(SqliteLib)" />
     <!-- PGO training build: the instrumented SQLite needs libgcov. -->
     <LinkerArg Include="-fprofile-generate" Condition="'$(PgoGen)' == 'true'" />
+    <!-- PROFILE=1 builds: keep SQLite's static function names (NativeAOT links with discard-all). -->
+    <LinkerArg Include="-Wl,--discard-none" Condition="'$(KeepLocals)' == 'true'" />
     <DirectPInvoke Include="libc" />
   </ItemGroup>
 </Project>
