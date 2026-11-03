@@ -86,6 +86,8 @@ unsafe sealed partial class Server
         _scratch = (byte*)NativeMemory.Alloc(InMax);
         _name = (byte*)NativeMemory.Alloc(1024);
         Out.Pool = _outPool;
+        _db.SelfCheck(&_conns[0]);
+        ReleaseOut(&_conns[0]);
         AddRing();
         Log.Info($"{_slots} connections per ring, up to {MaxRings} rings");
     }
@@ -369,7 +371,7 @@ unsafe sealed partial class Server
         {
             bool txn = _db.Begin();
             for (int i = 0; i < _readyCount; i++) Handle(&_conns[_ready[i]]);
-            if (txn) _db.Commit();
+            if (txn) _db.EndRead();
             for (int i = 0; i < _readyCount; i++) QueueSend(_ready[i]);
             _readyCount = 0;
         }

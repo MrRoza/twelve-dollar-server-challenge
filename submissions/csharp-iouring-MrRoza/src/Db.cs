@@ -9,7 +9,9 @@ unsafe sealed class Db
 {
     readonly nint _db;
     readonly nint _begin, _beginImmediate, _commit, _rollback, _health, _feed, _post, _insertPost, _postExists, _insertLike;
-    readonly nint _feedIds, _feedLikes, _feedRows;
+    readonly nint _feedIds, _feedLikes, _feedRows, _touch;
+    BtReader? _bt;                 // B-tree reads; null = SQL only
+    bool _readOpen;                // the batch's read transaction has started (a statement ran in it)
     readonly byte* _feedScratch = (byte*)NativeMemory.Alloc(FeedScratchSize);
     const int FeedScratchSize = 1 << 18; // 20 posts x 500 chars x 6 bytes worst-case escaping, with room to spare
     const int FeedRangeMax = 512;
@@ -40,6 +42,8 @@ unsafe sealed class Db
         _feedLikes = Prep("SELECT post_id, count(*) FROM likes WHERE post_id BETWEEN ?1 AND ?2 GROUP BY post_id");
         _feedRows = Prep("SELECT p.id, p.body, p.created_at, u.username FROM posts p JOIN users u ON u.id = p.user_id " +
                          "WHERE p.id BETWEEN ?1 AND ?2");
+        _touch = Prep("SELECT 1 FROM posts WHERE id = 0"); // opens the read transaction for the B-tree cursors
+        _bt = MakeBtReader();
         _insertPost = Prep("INSERT INTO posts (user_id, body) VALUES (?, ?) RETURNING id, created_at");
         _postExists = Prep("SELECT 1 FROM posts WHERE id = ?");
         _insertLike = Prep("INSERT INTO likes (user_id, post_id) VALUES (?, ?) ON CONFLICT (user_id, post_id) DO NOTHING");
@@ -83,7 +87,81 @@ unsafe sealed class Db
         return rc == Sqlite.DONE || rc == Sqlite.ROW;
     }
 
-    public bool Begin() => Run(_begin);
+    public bool Begin() { _readOpen = false; return Run(_begin); }
+
+    /// <summary>Ends the batch's read transaction (B-tree cursors are closed first).</summary>
+    public bool EndRead()
+    {
+        _bt?.Close();
+        return Run(_commit);
+    }
+
+    /// <summary>B-tree cursors need the read transaction itself open; a statement in it does that (it stays open
+    /// until COMMIT because we are inside BEGIN).</summary>
+    bool BtReady()
+    {
+        if (_bt == null) return false;
+        if (!_readOpen) { if (!Run(_touch)) return false; _readOpen = true; }
+        return true;
+    }
+
+    BtReader? MakeBtReader()
+    {
+        // Root pages are fixed while we run: no auto_vacuum, and unix-excl keeps other processes off the file.
+        if (ScalarInt("PRAGMA auto_vacuum") != 0) { Log.Info("auto_vacuum is on: B-tree reads disabled"); return null; }
+        uint posts = Root("posts"), users = Root("users"), likesByPost = Root("likes_post_id_idx"), byTime = Root("posts_created_at_id_idx");
+        if (posts == 0 || users == 0 || likesByPost == 0 || byTime == 0) { Log.Info("schema not as expected: B-tree reads disabled"); return null; }
+        return new BtReader(_db, posts, users, likesByPost, byTime);
+    }
+
+    long ScalarInt(string sql)
+    {
+        nint st = Prep(sql);
+        long v = Sqlite.sqlite3_step(st) == Sqlite.ROW ? Sqlite.sqlite3_column_int64(st, 0) : -1;
+        Sqlite.sqlite3_finalize(st);
+        return v;
+    }
+
+    uint Root(string name)
+    {
+        nint st = Prep("SELECT rootpage FROM sqlite_schema WHERE name = '" + name + "'");
+        uint v = Sqlite.sqlite3_step(st) == Sqlite.ROW ? (uint)Sqlite.sqlite3_column_int64(st, 0) : 0;
+        Sqlite.sqlite3_finalize(st);
+        return v;
+    }
+
+    /// <summary>
+    /// At startup: the B-tree path must produce byte-for-byte what the SQL path produces (feed and a few posts),
+    /// else it is switched off. Guards against any schema/record-format surprise.
+    /// </summary>
+    public void SelfCheck(Conn* c)
+    {
+        if (_bt == null) return;
+        long[] probe = { 1, 2, 250000, 500000, 999999999 };
+        bool ok = true;
+        string? first = null;
+        for (int k = -1; k < probe.Length && ok; k++)
+        {
+            string a = Capture(c, true, k < 0 ? 0 : probe[k]), b = Capture(c, false, k < 0 ? 0 : probe[k]);
+            if (a != b) { ok = false; first = $"probe {(k < 0 ? "feed" : probe[k].ToString())}: btree={a[..Math.Min(200, a.Length)]} sql={b[..Math.Min(200, b.Length)]}"; }
+        }
+        if (!ok) { Log.Info("B-tree reads disabled, self-check mismatch: " + first); _bt = null; }
+        else Log.Info("B-tree reads on (self-check passed)");
+    }
+
+    string Capture(Conn* c, bool bt, long postId)
+    {
+        var saved = _bt;
+        if (!bt) _bt = null;
+        Begin();
+        Out.Begin(c);
+        int r = postId == 0 ? (Feed() ? 1 : -1) : Post(postId);
+        int len = Out.Pos - Out.HeaderRoom;
+        string s = r + ":" + Encoding.UTF8.GetString(Out.At(Out.HeaderRoom), len);
+        EndRead();
+        _bt = saved;
+        return s;
+    }
     /// <summary>False when the write lock is taken (SQLITE_BUSY): never waits.</summary>
     public bool BeginImmediate() => Run(_beginImmediate);
     public bool InTransaction => Sqlite.sqlite3_get_autocommit(_db) == 0;
@@ -121,6 +199,17 @@ unsafe sealed class Db
     /// Everything runs in the batch's read transaction, so all three scans see the same snapshot.
     /// </summary>
     public bool Feed()
+    {
+        if (BtReady())
+        {
+            int start = Out.Pos;
+            if (_bt!.Feed()) return true;
+            Out.Pos = start; // fall back to SQL
+        }
+        return FeedSql();
+    }
+
+    bool FeedSql()
     {
         long* ids = stackalloc long[20];
         int n = 0, rc;
@@ -203,6 +292,13 @@ unsafe sealed class Db
     /// <summary>1 = written, 0 = not found, -1 = error.</summary>
     public int Post(long id)
     {
+        if (BtReady())
+        {
+            int start = Out.Pos;
+            int b = _bt!.Post(id);
+            if (b >= 0) return b;
+            Out.Pos = start; // fall back to SQL
+        }
         Sqlite.sqlite3_bind_int64(_post, 1, id);
         int rc = Sqlite.sqlite3_step(_post);
         int r = -1;
