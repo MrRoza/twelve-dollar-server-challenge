@@ -358,8 +358,12 @@ unsafe sealed class Db
     {
         int RestartFrames = (int)Tune.Get("CKPT_RESTART", 20000);
         int PeriodMs = (int)Tune.Get("CKPT_MS", 250);
+        int Nice = (int)Tune.Get("CKPT_NICE", 19);
         var t = new Thread(() =>
         {
+            // Lowest priority for this thread only (our own process): on one vCPU a checkpoint's page copying
+            // otherwise competes with the event loop and shows up as tail latency.
+            if (Nice != 0) Libc.setpriority(0 /*PRIO_PROCESS*/, (int)Libc.syscall(Libc.SYS_gettid, 0, 0, 0, 0, 0, 0), Nice);
             nint db = Open(path);
             Exec(db, "PRAGMA busy_timeout=200");
             Exec(db, "PRAGMA wal_autocheckpoint=0");

@@ -24,6 +24,8 @@ static unsafe class Libc
     [DllImport("libc")] public static extern nint write(int fd, byte* buf, nuint n);
 
     [DllImport("libc")] public static extern int getrlimit(int resource, ulong* rlim);
+    [DllImport("libc")] public static extern int setpriority(int which, int who, int prio);
+    public const long SYS_gettid = 186;
     [DllImport("libc")] public static extern int epoll_create1(int flags);
     [DllImport("libc")] public static extern int epoll_ctl(int epfd, int op, int fd, byte* ev);
     [DllImport("libc")] public static extern int epoll_wait(int epfd, byte* events, int max, int timeoutMs);
